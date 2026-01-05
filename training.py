@@ -253,7 +253,10 @@ def train_for_steps(model, train_loader, val_loader, n_steps,
             writer.add_scalar('train/sector_loss', s_loss.item(), global_step)
             writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
 
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        postfix = {'v': f'{v_loss.item():.3f}', 'p': f'{p_loss.item():.2f}'}
+        if use_auxiliary:
+            postfix['s'] = f'{s_loss.item():.2f}'
+        pbar.set_postfix(postfix)
         pbar.update(1)
         global_step += 1
 
@@ -263,8 +266,11 @@ def train_for_steps(model, train_loader, val_loader, n_steps,
     val_metrics = evaluate(model, val_loader, device, use_auxiliary, value_only)
 
     if not silent:
-        print(f"Final validation: loss={val_metrics['loss']:.4f} "
-              f"v_acc={val_metrics['value_acc']:.3f} p_acc={val_metrics['policy_acc']:.3f}")
+        msg = (f"Final val: v_loss={val_metrics['value_loss']:.4f} p_loss={val_metrics['policy_loss']:.4f} "
+               f"v_acc={val_metrics['value_acc']:.1%} p_acc={val_metrics['policy_acc']:.1%}")
+        if use_auxiliary:
+            msg += f" s_loss={val_metrics['sector_loss']:.4f}"
+        print(msg)
 
     # Save checkpoint
     if output_path:
@@ -386,8 +392,11 @@ def train_model(model, train_loader, val_loader, n_epochs,
                 writer.add_scalar('train/sector_loss', s_loss.item(), global_step)
                 writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
 
-            # Update progress bar with current loss
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Update progress bar with value and policy loss (and sector if auxiliary)
+            postfix = {'v': f'{v_loss.item():.3f}', 'p': f'{p_loss.item():.2f}'}
+            if use_auxiliary:
+                postfix['s'] = f'{s_loss.item():.2f}'
+            pbar.set_postfix(postfix)
 
             global_step += 1
 
