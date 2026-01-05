@@ -205,13 +205,13 @@ class DomineeringTransformer(nn.Module):
         cls = x[:, -1]        # (batch, d_model)
 
         # Output heads
-        value = torch.sigmoid(self.value_head(cls))  # (batch, 1)
+        value = self.value_head(cls)  # (batch, 1) - logits, apply sigmoid outside for prob
         sector = self.sector_head(cls)               # (batch, 16)
         policy_logits = self.policy_head(spatial)    # (batch, 480)
 
         # Mask illegal moves
         if mask is not None:
-            policy_logits = policy_logits.masked_fill(~mask, -1e9)
+            policy_logits = policy_logits.masked_fill(~mask, -1e4)
 
         return value, policy_logits, sector
 
@@ -244,13 +244,13 @@ class DomineeringTransformer(nn.Module):
         cls = x[:, -1]
 
         # Output heads
-        value = torch.sigmoid(self.value_head(cls))
+        value = self.value_head(cls)
         sector = self.sector_head(cls)
         policy_logits = self.policy_head(spatial)
 
         # Mask illegal moves
         if mask is not None:
-            policy_logits = policy_logits.masked_fill(~mask, -1e9)
+            policy_logits = policy_logits.masked_fill(~mask, -1e4)
 
         return value, policy_logits, sector
 

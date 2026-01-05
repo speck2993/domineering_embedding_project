@@ -47,14 +47,17 @@ This is a machine learning research project investigating neural network embeddi
 
 ## WSL Environment
 
-This project runs in WSL. Python with numpy/torch is available via Windows miniconda:
+This project runs in WSL. Python with numpy/torch is available via miniforge:
 
 ```bash
 # Run Python scripts
-/mnt/c/Users/18013/miniconda3/python.exe script.py
+python3 script.py
 
 # Run tests
-/mnt/c/Users/18013/miniconda3/python.exe domineering_game.py
+python3 domineering_game.py
 ```
 
-The Linux `python3` does not have numpy installed. Always use the Windows Python path above.
+Required dependencies:
+- numpy
+- torch
+- tensorboard

@@ -13,6 +13,7 @@ Optimizations:
 
 import numpy as np
 import random
+import sys
 import time
 import os
 from typing import Tuple, Optional, List, Dict
@@ -20,6 +21,14 @@ from multiprocessing import Pool, cpu_count
 from enum import IntEnum
 
 import domineering_game as dg
+
+
+def print_progress(msg, end='\n'):
+    """Print with line clearing for clean updates."""
+    sys.stdout.write(f"\r\033[K{msg}")
+    if end:
+        sys.stdout.write(end)
+    sys.stdout.flush()
 
 # Constants from domineering_game
 P_MOVES = dg.P_MOVES  # 240 - vertical moves are 0-239
@@ -436,12 +445,12 @@ def generate_phase1_data(n_games: int, output_path: str = 'data/phase1_games.npz
                     games_per_sec = 100 / (now - last_checkpoint_time) if now > last_checkpoint_time else 0
                     last_checkpoint_time = now
                     eta = (n_random - game_idx - 1) / games_per_sec if games_per_sec > 0 else 0
-                    print(f"  Random {game_idx + 1:5d}/{n_random} | "
-                          f"{games_per_sec:.2f} g/s | "
-                          f"ETA: {eta/60:.1f}m")
+                    print_progress(f"  Random {game_idx + 1:5d}/{n_random} | "
+                                   f"{games_per_sec:.2f} g/s | "
+                                   f"ETA: {eta/60:.1f}m", end='')
 
-        print(f"  Random games complete: V-win {100*random_v_wins/n_random:.1f}%, "
-              f"avg {random_moves/n_random:.0f} moves")
+        print_progress(f"  Random games complete: V-win {100*random_v_wins/n_random:.1f}%, "
+                       f"avg {random_moves/n_random:.0f} moves")
         print()
 
     # Phase 2: Generate guided games
@@ -466,12 +475,12 @@ def generate_phase1_data(n_games: int, output_path: str = 'data/phase1_games.npz
                     games_per_sec = 100 / (now - last_checkpoint_time) if now > last_checkpoint_time else 0
                     last_checkpoint_time = now
                     eta = (n_guided - game_idx - 1) / games_per_sec if games_per_sec > 0 else 0
-                    print(f"  Guided {game_idx + 1:5d}/{n_guided} | "
-                          f"{games_per_sec:.2f} g/s | "
-                          f"ETA: {eta/60:.1f}m")
+                    print_progress(f"  Guided {game_idx + 1:5d}/{n_guided} | "
+                                   f"{games_per_sec:.2f} g/s | "
+                                   f"ETA: {eta/60:.1f}m", end='')
 
-        print(f"  Guided games complete: V-win {100*guided_v_wins/n_guided:.1f}%, "
-              f"avg {guided_moves/n_guided:.0f} moves")
+        print_progress(f"  Guided games complete: V-win {100*guided_v_wins/n_guided:.1f}%, "
+                       f"avg {guided_moves/n_guided:.0f} moves")
 
     # Final save
     _save_game_records(output_path, all_games)

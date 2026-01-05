@@ -20,7 +20,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from config import LR, WEIGHT_DECAY, BATCH_SIZE, SECTOR_LOSS_WEIGHT
+from config import LR, WEIGHT_DECAY, BATCH_SIZE, POLICY_LOSS_WEIGHT, SECTOR_LOSS_WEIGHT
 from model import create_small_model, create_medium_model, create_large_model, count_parameters
 from data_loader import DomineeringDataset
 
@@ -66,8 +66,8 @@ def compute_losses(value_pred, policy_logits, sector_pred, batch,
     Returns:
         total_loss, value_loss, policy_loss, sector_loss (all scalar tensors)
     """
-    # Value loss: BCE (target is 0.0 or 1.0, pred is sigmoid output)
-    value_loss = F.binary_cross_entropy(value_pred.squeeze(-1), batch['value'])
+    # Value loss: BCE with logits (numerically stable for FP16)
+    value_loss = F.binary_cross_entropy_with_logits(value_pred.squeeze(-1), batch['value'])
 
     # Value-only mode for bootstrap self-play model
     if value_only:
@@ -80,11 +80,11 @@ def compute_losses(value_pred, policy_logits, sector_pred, batch,
     # Sector loss: MSE on sector balance predictions
     sector_loss = F.mse_loss(sector_pred, batch['sectors'])
 
-    # Total loss
+    # Total loss (policy weighted to balance with value loss)
     if use_auxiliary:
-        total_loss = value_loss + policy_loss + SECTOR_LOSS_WEIGHT * sector_loss
+        total_loss = value_loss + POLICY_LOSS_WEIGHT * policy_loss + SECTOR_LOSS_WEIGHT * sector_loss
     else:
-        total_loss = value_loss + policy_loss
+        total_loss = value_loss + POLICY_LOSS_WEIGHT * policy_loss
 
     return total_loss, value_loss, policy_loss, sector_loss
 
@@ -135,8 +135,8 @@ def evaluate(model, val_loader, device, use_auxiliary=True, value_only=False):
         total_policy_loss += p_loss.item() * batch_size
         total_sector_loss += s_loss.item() * batch_size
 
-        # Value accuracy (threshold at 0.5)
-        value_preds_binary = (value_pred.squeeze(-1) > 0.5).float()
+        # Value accuracy (threshold at 0.5, apply sigmoid since model outputs logits)
+        value_preds_binary = (torch.sigmoid(value_pred.squeeze(-1)) > 0.5).float()
         total_value_correct += (value_preds_binary == value_target).sum().item()
 
         # Policy top-1 accuracy
@@ -158,6 +158,135 @@ def evaluate(model, val_loader, device, use_auxiliary=True, value_only=False):
 # ============================================================================
 # Training Loop
 # ============================================================================
+
+def train_for_steps(model, train_loader, val_loader, n_steps,
+                    use_auxiliary=True, value_only=False, device='cuda',
+                    output_path=None, logdir=None, seed=42, silent=False):
+    """Train a model for a fixed number of gradient steps.
+
+    Cycles through train_loader as needed to reach n_steps.
+
+    Args:
+        model: DomineeringTransformer to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        n_steps: Number of gradient steps to train
+        use_auxiliary: Whether to use auxiliary sector loss
+        value_only: If True, only train value head
+        device: Device to train on
+        output_path: Path to save final checkpoint
+        logdir: Directory for Tensorboard logs
+        seed: Random seed
+        silent: If True, suppress progress output
+
+    Returns:
+        Dict with final metrics
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    model = model.to(device)
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    amp_context = autocast(device_type='cuda') if device_type == 'cuda' else nullcontext()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    scheduler = CosineAnnealingLR(optimizer, T_max=n_steps)
+
+    use_scaler = device_type == 'cuda'
+    scaler = GradScaler() if use_scaler else None
+
+    writer = None
+    if logdir:
+        os.makedirs(logdir, exist_ok=True)
+        writer = SummaryWriter(logdir)
+
+    if not silent:
+        print(f"Training for {n_steps} steps")
+        print(f"Auxiliary task: {use_auxiliary}, Value only: {value_only}")
+        print(f"Parameters: {count_parameters(model):,}")
+
+    model.train()
+    train_iter = iter(train_loader)
+    global_step = 0
+
+    pbar = tqdm(total=n_steps, desc="Training", disable=silent, ncols=80, mininterval=1.0)
+    while global_step < n_steps:
+        # Get next batch, cycling if needed
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        # Move to device
+        tokens = batch['tokens'].to(device)
+        mask = batch['mask'].to(device)
+        value_target = batch['value'].to(device)
+        policy_target = batch['policy'].to(device)
+        sectors_target = batch['sectors'].to(device)
+
+        # Forward pass
+        optimizer.zero_grad()
+        with amp_context:
+            value_pred, policy_logits, sector_pred = model(tokens, mask)
+            loss, v_loss, p_loss, s_loss = compute_losses(
+                value_pred, policy_logits, sector_pred,
+                {'value': value_target, 'policy': policy_target, 'sectors': sectors_target},
+                use_auxiliary, value_only
+            )
+
+        # Backward pass
+        if use_scaler:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        # Log to tensorboard
+        if writer and global_step % 100 == 0:
+            writer.add_scalar('train/loss', loss.item(), global_step)
+            writer.add_scalar('train/value_loss', v_loss.item(), global_step)
+            writer.add_scalar('train/policy_loss', p_loss.item(), global_step)
+            writer.add_scalar('train/sector_loss', s_loss.item(), global_step)
+            writer.add_scalar('train/lr', scheduler.get_last_lr()[0], global_step)
+
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        pbar.update(1)
+        global_step += 1
+
+    pbar.close()
+
+    # Final validation
+    val_metrics = evaluate(model, val_loader, device, use_auxiliary, value_only)
+
+    if not silent:
+        print(f"Final validation: loss={val_metrics['loss']:.4f} "
+              f"v_acc={val_metrics['value_acc']:.3f} p_acc={val_metrics['policy_acc']:.3f}")
+
+    # Save checkpoint
+    if output_path:
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'steps': n_steps,
+            'val_loss': val_metrics['loss'],
+            'use_auxiliary': use_auxiliary,
+            'value_only': value_only,
+        }, output_path)
+        if not silent:
+            print(f"Saved checkpoint to {output_path}")
+
+    if writer:
+        writer.close()
+
+    return val_metrics
+
 
 def train_model(model, train_loader, val_loader, n_epochs,
                 use_auxiliary=True, value_only=False, device='cuda',
@@ -215,7 +344,7 @@ def train_model(model, train_loader, val_loader, n_epochs,
         epoch_start = time.time()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}",
-                    leave=False, ncols=80)
+                    leave=False, ncols=80, mininterval=1.0)
         for batch_idx, batch in enumerate(pbar):
             # Move to device
             tokens = batch['tokens'].to(device)
