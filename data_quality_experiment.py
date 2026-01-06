@@ -189,17 +189,17 @@ def run_experiment(phase0_path, selfplay_path, n_epochs=3, n_openings=200,
     # -------------------------------------------------------------------------
     print("\n[4/5] Head-to-head evaluation...")
 
-    print(f"\n  A vs B ({n_openings * 2} games)...")
+    print(f"\n  A vs B ({n_openings} openings)...")
     h2h_ab = compare_models(model_a, model_b, n_openings=n_openings, device=device)
-    print(f"    A wins: {h2h_ab['a_wins']}/{h2h_ab['total']} ({h2h_ab['a_win_rate']:.1%})")
+    print(f"    Decisive: A={h2h_ab['decisive_a']}, B={h2h_ab['decisive_b']}, washes={h2h_ab['washes']}, p={h2h_ab['p_value']:.4f}")
 
-    print(f"\n  A vs C ({n_openings * 2} games)...")
+    print(f"\n  A vs C ({n_openings} openings)...")
     h2h_ac = compare_models(model_a, model_c, n_openings=n_openings, device=device)
-    print(f"    A wins: {h2h_ac['a_wins']}/{h2h_ac['total']} ({h2h_ac['a_win_rate']:.1%})")
+    print(f"    Decisive: A={h2h_ac['decisive_a']}, C={h2h_ac['decisive_b']}, washes={h2h_ac['washes']}, p={h2h_ac['p_value']:.4f}")
 
-    print(f"\n  B vs C ({n_openings * 2} games)...")
+    print(f"\n  B vs C ({n_openings} openings)...")
     h2h_bc = compare_models(model_b, model_c, n_openings=n_openings, device=device)
-    print(f"    B wins: {h2h_bc['a_wins']}/{h2h_bc['total']} ({h2h_bc['a_win_rate']:.1%})")
+    print(f"    Decisive: B={h2h_bc['decisive_a']}, C={h2h_bc['decisive_b']}, washes={h2h_bc['washes']}, p={h2h_bc['p_value']:.4f}")
 
     # -------------------------------------------------------------------------
     # Step 5: Results summary
@@ -218,38 +218,41 @@ def run_experiment(phase0_path, selfplay_path, n_epochs=3, n_openings=200,
         print(f"{name:<10} {metrics['loss']:>10.4f} {metrics['value_loss']:>10.4f} "
               f"{metrics['policy_loss']:>10.4f} {metrics['value_acc']:>10.1%} {metrics['policy_acc']:>10.1%}")
 
-    print("\nHEAD-TO-HEAD RESULTS:")
+    print("\nHEAD-TO-HEAD RESULTS (decisive pairs):")
     print("-" * 60)
-    print(f"A vs B: A={h2h_ab['a_wins']:>3}, B={h2h_ab['b_wins']:>3} (A win rate: {h2h_ab['a_win_rate']:.1%})")
-    print(f"A vs C: A={h2h_ac['a_wins']:>3}, C={h2h_ac['b_wins']:>3} (A win rate: {h2h_ac['a_win_rate']:.1%})")
-    print(f"B vs C: B={h2h_bc['a_wins']:>3}, C={h2h_bc['b_wins']:>3} (B win rate: {h2h_bc['a_win_rate']:.1%})")
+    print(f"{'Matchup':<10} {'Model 1':>10} {'Model 2':>10} {'Washes':>10} {'p-value':>10}")
+    print("-" * 60)
+    print(f"{'A vs B':<10} {h2h_ab['decisive_a']:>10} {h2h_ab['decisive_b']:>10} {h2h_ab['washes']:>10} {h2h_ab['p_value']:>10.4f}")
+    print(f"{'A vs C':<10} {h2h_ac['decisive_a']:>10} {h2h_ac['decisive_b']:>10} {h2h_ac['washes']:>10} {h2h_ac['p_value']:>10.4f}")
+    print(f"{'B vs C':<10} {h2h_bc['decisive_a']:>10} {h2h_bc['decisive_b']:>10} {h2h_bc['washes']:>10} {h2h_bc['p_value']:>10.4f}")
 
-    print("\nINTERPRETATION:")
+    print("\nINTERPRETATION (p < 0.05 = significant):")
     print("-" * 60)
 
     # Primary question: Does more data help? (C vs A)
-    if h2h_ac['a_win_rate'] < 0.45:
+    # Note: In h2h_ac, 'decisive_a' is A's wins, 'decisive_b' is C's wins
+    if h2h_ac['decisive_b'] > h2h_ac['decisive_a'] and h2h_ac['p_value'] < 0.05:
         print("✓ C >> A: More data (phase0 + selfplay) produces significantly better models")
-    elif h2h_ac['a_win_rate'] < 0.55:
-        print("~ C ≈ A: More data provides marginal improvement")
+    elif h2h_ac['decisive_a'] > h2h_ac['decisive_b'] and h2h_ac['p_value'] < 0.05:
+        print("✗ A >> C: More data did NOT help (unexpected!)")
     else:
-        print("✗ A > C: More data did NOT help (unexpected!)")
+        print("~ C ≈ A: No significant difference")
 
     # Secondary question: Is combined data better per-sample? (B vs A)
-    if h2h_ab['a_win_rate'] < 0.45:
+    if h2h_ab['decisive_b'] > h2h_ab['decisive_a'] and h2h_ab['p_value'] < 0.05:
         print("✓ B >> A: Combined data is higher quality per-sample")
-    elif h2h_ab['a_win_rate'] < 0.55:
-        print("~ B ≈ A: Per-sample quality is similar")
+    elif h2h_ab['decisive_a'] > h2h_ab['decisive_b'] and h2h_ab['p_value'] < 0.05:
+        print("✗ A >> B: Phase0 data is higher quality per-sample (unexpected!)")
     else:
-        print("✗ A > B: Phase0 data is higher quality per-sample (unexpected!)")
+        print("~ B ≈ A: No significant difference in per-sample quality")
 
     # Does more training on all data help? (C vs B)
-    if h2h_bc['a_win_rate'] < 0.45:
+    if h2h_bc['decisive_b'] > h2h_bc['decisive_a'] and h2h_bc['p_value'] < 0.05:
         print("✓ C >> B: Longer training on combined data helps")
-    elif h2h_bc['a_win_rate'] < 0.55:
-        print("~ C ≈ B: Additional training provides marginal benefit")
+    elif h2h_bc['decisive_a'] > h2h_bc['decisive_b'] and h2h_bc['p_value'] < 0.05:
+        print("? B >> C: More training hurt (possible overfitting)")
     else:
-        print("? B > C: More training hurt (possible overfitting)")
+        print("~ C ≈ B: No significant difference from additional training")
 
     print(f"\nTotal time: {elapsed/60:.1f} minutes")
 

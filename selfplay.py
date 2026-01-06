@@ -349,13 +349,52 @@ def generate_random_opening(seed, n_moves=10):
 # Model Comparison
 # ============================================================================
 
+def mcnemar_test(decisive_a, decisive_b):
+    """Compute McNemar's test for paired binary outcomes.
+
+    Args:
+        decisive_a: Number of openings where A won both games
+        decisive_b: Number of openings where B won both games
+
+    Returns:
+        p_value: Two-sided p-value from McNemar's test
+    """
+    # McNemar's test: compare discordant pairs
+    # Under null hypothesis, b and c should be equal
+    b, c = decisive_a, decisive_b
+
+    if b + c == 0:
+        return 1.0  # No decisive outcomes, no evidence either way
+
+    # Use normal approximation (valid when b + c >= 25)
+    # For smaller samples, could use exact binomial test
+    import math
+    z = (b - c) / math.sqrt(b + c)
+
+    # Two-sided p-value from standard normal
+    # P(|Z| > |z|) = 2 * P(Z > |z|)
+    from math import erf
+    p_value = 2 * (1 - 0.5 * (1 + erf(abs(z) / math.sqrt(2))))
+
+    return p_value
+
+
 def compare_models(model_a, model_b, n_openings=150, device='cpu'):
-    """Compare two models with duplicate games for fairness."""
+    """Compare two models with duplicate games for fairness.
+
+    For each opening, plays two games (swapping colors). Outcomes:
+    - Decisive for A: A wins both games
+    - Decisive for B: B wins both games
+    - Wash: Each model wins one game
+
+    Uses McNemar's test on decisive pairs to determine significance.
+    """
     pred_a = ValuePredictor(model_a, device)
     pred_b = ValuePredictor(model_b, device)
 
-    a_wins = 0
-    b_wins = 0
+    decisive_a = 0  # Openings where A won both
+    decisive_b = 0  # Openings where B won both
+    washes = 0      # Openings where each won one
     games = []
 
     for i in range(n_openings):
@@ -364,25 +403,42 @@ def compare_models(model_a, model_b, n_openings=150, device='cpu'):
         # Game 1: A = vertical, B = horizontal
         result1 = play_game_from_opening(pred_a, pred_b, opening)
         games.append(result1)
-        if result1['vertical_won']:
-            a_wins += 1
-        else:
-            b_wins += 1
+        a_won_as_v = result1['vertical_won']
 
         # Game 2: A = horizontal, B = vertical
         result2 = play_game_from_opening(pred_b, pred_a, opening)
         games.append(result2)
-        if result2['vertical_won']:
-            b_wins += 1
-        else:
-            a_wins += 1
+        a_won_as_h = not result2['vertical_won']
 
-    total = 2 * n_openings
+        # Classify this opening
+        if a_won_as_v and a_won_as_h:
+            decisive_a += 1
+        elif not a_won_as_v and not a_won_as_h:
+            decisive_b += 1
+        else:
+            washes += 1
+
+    # Compute McNemar's test
+    p_value = mcnemar_test(decisive_a, decisive_b)
+
+    # A is significantly better if it has more decisive wins AND p < 0.05
+    a_significantly_better = decisive_a > decisive_b and p_value < 0.05
+
+    # Also compute traditional win counts for backwards compatibility
+    a_wins = decisive_a * 2 + washes
+    b_wins = decisive_b * 2 + washes
+
     return {
+        'decisive_a': decisive_a,
+        'decisive_b': decisive_b,
+        'washes': washes,
+        'p_value': p_value,
+        'a_significantly_better': a_significantly_better,
+        # Legacy fields
         'a_wins': a_wins,
         'b_wins': b_wins,
-        'total': total,
-        'a_win_rate': a_wins / total,
+        'total': 2 * n_openings,
+        'a_win_rate': a_wins / (2 * n_openings),
         'games': games
     }
 
@@ -571,18 +627,19 @@ def iterative_selfplay(initial_model_path, target_games, output_path,
 
         pending_games.extend(comparison['games'])
 
-        print(f"  New model: {comparison['a_wins']}/{comparison['total']} ({comparison['a_win_rate']:.1%})")
+        print(f"  Decisive: new={comparison['decisive_a']}, old={comparison['decisive_b']}, washes={comparison['washes']}")
+        print(f"  McNemar p-value: {comparison['p_value']:.4f}")
         print(f"  Comparison completed in {format_duration(compare_elapsed)}")
 
-        # Decide whether to keep new model
-        if comparison['a_wins'] > comparison['b_wins']:
-            print("  -> New model wins! Updating baseline.")
+        # Decide whether to keep new model (must be significantly better at p < 0.05)
+        if comparison['a_significantly_better']:
+            print("  -> New model significantly better (p < 0.05)! Updating baseline.")
             baseline_model = new_model
             all_games.extend(pending_games)
             pending_games = []
             model_updates += 1
         else:
-            print("  -> Baseline holds. Accumulating more data.")
+            print("  -> No significant improvement. Accumulating more data.")
 
         # Clean up temp file
         if os.path.exists(temp_path):
