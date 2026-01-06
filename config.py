@@ -5,7 +5,7 @@ SMALL_CONFIG = {
     'd_model': 128,
     'd_head': 16,
     'n_heads': 4,
-    'n_layers': 2,
+    'n_layers': 3,
     'd_mlp': 512
 }
 
@@ -13,7 +13,7 @@ LARGE_CONFIG = {
     'd_model': 128,
     'd_head': 16,
     'n_heads': 8,
-    'n_layers': 7,
+    'n_layers': 6,
     'd_mlp': 768
 }
 

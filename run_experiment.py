@@ -355,7 +355,7 @@ def run_experiment(phase0_path='data/phase0_games.npz',
 
     # Create data loaders
     # Use more positions per game for large models (~116 avg positions/game available)
-    train_dataset = DomineeringDataset(combined_path, split='train', positions_per_game=50)
+    train_dataset = DomineeringDataset(combined_path, split='train', positions_per_game=60)
     val_dataset = DomineeringDataset(combined_path, split='val', positions_per_game=20)
 
     n_workers = 4 if device == 'cuda' else 2
