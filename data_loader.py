@@ -110,11 +110,13 @@ def compute_sector_targets_fast(remaining_moves):
         remaining_moves: (480,) bool array of remaining legal moves
 
     Returns:
-        (16,) float32 array of (v_count - h_count) per sector
+        (16,) float32 array of (v_count - h_count) / 10 per sector
+        Divided by 10 to normalize to roughly [-2, 2] range for stable MSE training.
     """
     v_counts = (remaining_moves & sector_v_masks).sum(axis=1)
     h_counts = (remaining_moves & sector_h_masks).sum(axis=1)
-    return (v_counts - h_counts).astype(np.float32)
+    # Normalize by 10 to bring targets to roughly [-2, 2] range
+    return ((v_counts - h_counts) / 10.0).astype(np.float32)
 
 
 def make_position(moves, length, winner, pos_idx, symmetry):
