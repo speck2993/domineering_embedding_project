@@ -319,7 +319,7 @@ def plot_final_probe_comparison(histories, output_path='plots/probe_final.png'):
 
 def run_experiment(phase0_path='data/phase0_games.npz',
                    selfplay_path='data/selfplay_games.npz',
-                   n_epochs=5, seed=42, device='cuda',
+                   n_epochs=3, seed=42, device='cuda',
                    probe_interval=1000):
     """Run the full embedding experiment.
 
