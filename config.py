@@ -35,10 +35,10 @@ N_SECTORS = 16      # auxiliary task outputs
 # Training hyperparameters (for later sections)
 LR = 3e-4
 WEIGHT_DECAY = 0.01
-BATCH_SIZE = 256
+BATCH_SIZE = 200
 
 # Loss weights
 # Value loss (BCE) is ~0.5-0.7, policy loss (CE over 480 classes) is ~3-4
 # Weight policy down to balance contributions
 POLICY_LOSS_WEIGHT = 0.2
-SECTOR_LOSS_WEIGHT = 0.25
+SECTOR_LOSS_WEIGHT = 0.8
