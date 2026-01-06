@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from tqdm import tqdm
 
 from config import BATCH_SIZE, SMALL_CONFIG, LARGE_CONFIG
 from model import create_small_model, create_large_model, count_parameters
@@ -122,7 +123,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         epoch_loss = 0.0
         epoch_samples = 0
 
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", ncols=100, mininterval=1.0)
+        for batch in pbar:
             # Move to device
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
@@ -142,6 +144,12 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
             epoch_samples += len(batch['tokens'])
             global_step += 1
 
+            # Update progress bar (show total weighted loss + components)
+            postfix = {'loss': f'{total_loss.item():.3f}', 'v': f'{v_loss.item():.3f}', 'p': f'{p_loss.item():.2f}'}
+            if use_auxiliary:
+                postfix['s'] = f'{s_loss.item():.2f}'
+            pbar.set_postfix(postfix)
+
             # Probe evaluation
             if global_step % probe_interval == 0:
                 model.eval()
@@ -151,6 +159,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                 for layer_idx, probe in probes.items():
                     history['probe_r2'][layer_idx].append(probe.val_r2)
                 model.train()
+
+        pbar.close()
 
         # End of epoch
         train_loss = epoch_loss / epoch_samples
@@ -165,7 +175,7 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         history['val_policy_loss'].append(val_metrics['policy_loss'])
         history['val_sector_loss'].append(val_metrics['sector_loss'])
 
-        print(f"  Epoch {epoch+1}/{n_epochs}: train={train_loss:.4f}, val={val_metrics['loss']:.4f}")
+        print(f"  Val: loss={val_metrics['loss']:.4f}, v_acc={val_metrics['value_acc']:.1%}, p_acc={val_metrics['policy_acc']:.1%}")
 
         # Save best
         if val_metrics['loss'] < best_val_loss:
