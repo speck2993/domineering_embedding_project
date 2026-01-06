@@ -126,10 +126,14 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
             # Move to device
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-            # Forward + backward
+            # Forward pass
             optimizer.zero_grad()
+            value_pred, policy_logits, sector_pred = model(batch['tokens'], batch['mask'])
+
+            # Compute losses
             total_loss, v_loss, p_loss, s_loss = compute_losses(
-                model, batch, use_auxiliary=use_auxiliary)
+                value_pred, policy_logits, sector_pred,
+                batch, use_auxiliary=use_auxiliary)
             total_loss.backward()
             optimizer.step()
             scheduler.step()
@@ -155,7 +159,7 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
 
         # Validation
         model.eval()
-        val_metrics = evaluate(model, val_loader, use_auxiliary=use_auxiliary, device=device)
+        val_metrics = evaluate(model, val_loader, device, use_auxiliary=use_auxiliary)
         history['val_loss'].append(val_metrics['loss'])
         history['val_value_loss'].append(val_metrics['value_loss'])
         history['val_policy_loss'].append(val_metrics['policy_loss'])
