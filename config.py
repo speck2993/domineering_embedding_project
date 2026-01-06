@@ -33,7 +33,7 @@ N_POLICY = 480      # move outputs
 N_SECTORS = 16      # auxiliary task outputs
 
 # Training hyperparameters (for later sections)
-LR = 3e-4
+LR = 2e-4
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 200
 

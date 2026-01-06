@@ -671,50 +671,156 @@ def iterative_selfplay(initial_model_path, target_games, output_path,
 
 
 # ============================================================================
+# Simple Generation (No Iterative Training)
+# ============================================================================
+
+def generate_with_trained_model(model_path, n_games, output_path,
+                                 n_parallel=16, device='cuda', seed=42,
+                                 model_type='large'):
+    """Generate games using a pre-trained model (no iterative improvement).
+
+    This is faster than iterative_selfplay() because it doesn't retrain the model.
+    Use this to generate additional training data using an already-trained model.
+
+    Args:
+        model_path: Path to trained model checkpoint (.pt file)
+        n_games: Number of games to generate
+        output_path: Where to save the NPZ file
+        n_parallel: Number of parallel games during generation
+        device: Device for inference
+        seed: Random seed
+        model_type: 'large', 'small', or 'medium' (default 'large')
+
+    Returns:
+        Dict with statistics
+    """
+    print("=" * 60)
+    print("Self-Play Generation (Fixed Model)")
+    print("=" * 60)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Load model
+    print(f"\nLoading model from {model_path}")
+    if model_type == 'large':
+        model = create_large_model()
+    elif model_type == 'small':
+        model = create_small_model()
+    else:
+        model = create_medium_model()
+
+    # Handle both full checkpoint and state_dict only
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+
+    model.to(device)
+    model.eval()
+    print(f"Model parameters: {count_parameters(model):,}")
+
+    # Generate games
+    print(f"\nGenerating {n_games} games (parallel={n_parallel})...")
+    start_time = time.time()
+
+    predictor = ValuePredictor(model, device)
+    runner = ParallelGameRunner(predictor, n_parallel=n_parallel)
+    games = runner.generate_games(n_games, seed=seed, progress_interval=30)
+
+    gen_elapsed = time.time() - start_time
+    print(f"\nGenerated {len(games)} games in {format_duration(gen_elapsed)} ({len(games)/gen_elapsed:.1f}/sec)")
+
+    # Save to NPZ
+    stats = games_to_npz(games, output_path)
+    print(f"Saved to {output_path}")
+    print(f"  Total games: {stats['n_games']}")
+    print(f"  Total positions: {stats['total_positions']:,}")
+    print(f"  Avg game length: {stats['avg_length']:.1f}")
+
+    # Win rate analysis
+    v_wins = sum(1 for g in games if g['vertical_won'])
+    print(f"  Vertical win rate: {100*v_wins/len(games):.1f}%")
+
+    return {**stats, 'elapsed': gen_elapsed}
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Iterative self-play data generation')
-    parser.add_argument('--initial_model', type=str, default=None,
-                        help='Path to initial trained model checkpoint')
-    parser.add_argument('--target_games', type=int, default=50000,
-                        help='Total number of games to generate')
-    parser.add_argument('--output', type=str, default='data/selfplay_games.npz',
-                        help='Output file path')
-    parser.add_argument('--batch_size', type=int, default=2500,
-                        help='Games per iteration')
-    parser.add_argument('--comparison_openings', type=int, default=150,
-                        help='Openings for model comparison (total games = 2x this)')
-    parser.add_argument('--n_parallel', type=int, default=16,
-                        help='Number of parallel games during generation')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--test', action='store_true',
-                        help='Run tests only')
+    parser = argparse.ArgumentParser(description='Self-play data generation')
+    subparsers = parser.add_subparsers(dest='mode', help='Generation mode')
+
+    # Iterative self-play (original)
+    iter_parser = subparsers.add_parser('iterative', help='Iterative self-play with model improvement')
+    iter_parser.add_argument('--initial_model', type=str, required=True,
+                            help='Path to initial trained model checkpoint')
+    iter_parser.add_argument('--target_games', type=int, default=50000,
+                            help='Total number of games to generate')
+    iter_parser.add_argument('--output', type=str, default='data/selfplay_games.npz',
+                            help='Output file path')
+    iter_parser.add_argument('--batch_size', type=int, default=2500,
+                            help='Games per iteration')
+    iter_parser.add_argument('--comparison_openings', type=int, default=150,
+                            help='Openings for model comparison (total games = 2x this)')
+    iter_parser.add_argument('--n_parallel', type=int, default=16,
+                            help='Number of parallel games during generation')
+    iter_parser.add_argument('--seed', type=int, default=42,
+                            help='Random seed')
+
+    # Simple generation (new)
+    gen_parser = subparsers.add_parser('generate', help='Generate games with fixed trained model')
+    gen_parser.add_argument('--model', type=str, required=True,
+                           help='Path to trained model checkpoint')
+    gen_parser.add_argument('--n_games', type=int, default=50000,
+                           help='Number of games to generate')
+    gen_parser.add_argument('--output', type=str, default='data/selfplay_additional.npz',
+                           help='Output file path')
+    gen_parser.add_argument('--n_parallel', type=int, default=16,
+                           help='Number of parallel games during generation')
+    gen_parser.add_argument('--seed', type=int, default=42,
+                           help='Random seed')
+    gen_parser.add_argument('--model_type', type=str, default='large',
+                           choices=['large', 'small', 'medium'],
+                           help='Type of model architecture')
+
+    # Test mode
+    test_parser = subparsers.add_parser('test', help='Run self-play tests')
 
     args = parser.parse_args()
-
-    if args.test:
-        run_selfplay_tests()
-        return
-
-    if args.initial_model is None:
-        parser.error("--initial_model is required when not running tests")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    iterative_selfplay(
-        initial_model_path=args.initial_model,
-        target_games=args.target_games,
-        output_path=args.output,
-        batch_size=args.batch_size,
-        comparison_openings=args.comparison_openings,
-        n_parallel=args.n_parallel,
-        device=device,
-        seed=args.seed
-    )
+    if args.mode == 'iterative':
+        iterative_selfplay(
+            initial_model_path=args.initial_model,
+            target_games=args.target_games,
+            output_path=args.output,
+            batch_size=args.batch_size,
+            comparison_openings=args.comparison_openings,
+            n_parallel=args.n_parallel,
+            device=device,
+            seed=args.seed
+        )
+    elif args.mode == 'generate':
+        generate_with_trained_model(
+            model_path=args.model,
+            n_games=args.n_games,
+            output_path=args.output,
+            n_parallel=args.n_parallel,
+            device=device,
+            seed=args.seed,
+            model_type=args.model_type
+        )
+    elif args.mode == 'test':
+        run_selfplay_tests()
+    else:
+        # Default: show help
+        parser.print_help()
 
 
 # ============================================================================

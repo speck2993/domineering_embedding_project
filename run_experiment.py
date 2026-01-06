@@ -1,21 +1,27 @@
 """Main experiment runner for the embedding study.
 
-Trains 5 models for seed=42:
-1. Small+aux: Small model with auxiliary sector task
-2. Small-noaux: Small model without auxiliary task
-3. Large-baseline: Large model from scratch, with auxiliary
-4. Large+embed(small+aux): Large with embedded small+aux, with auxiliary
-5. Large+embed(small-noaux): Large with embedded small-noaux, with auxiliary
+Trains models across multiple seeds:
+- Small+aux: Small model with auxiliary sector task
+- Small-noaux: Small model without auxiliary task
+- Large-baseline: Large model from scratch, WITHOUT auxiliary
+- Large+embed(small+aux): Large with embedded small+aux, WITHOUT auxiliary
+- Large+embed(small-noaux): Large with embedded small-noaux, WITHOUT auxiliary
 
-Collects probe R² throughout training and generates visualizations.
+Large models are NOT trained with auxiliary task - we only probe them
+to test whether sector representation persists from embedding.
+
+Collects probe R² throughout training and generates visualizations
+that are updated incrementally (can check during run).
 """
 
 import argparse
 import os
 import time
+import json
+import random
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from tqdm import tqdm
@@ -23,9 +29,22 @@ from tqdm import tqdm
 from config import BATCH_SIZE, SMALL_CONFIG, LARGE_CONFIG
 from model import create_small_model, create_large_model, count_parameters
 from data_loader import DomineeringDataset
-from training import train_model, collate_batch, evaluate
+from training import train_model, collate_batch, evaluate, compute_losses
 from embedding import embed_small_into_large, verify_embedding
 from probing import train_probes_all_layers, print_probe_summary
+
+
+# ============================================================================
+# Color scheme for plots
+# ============================================================================
+
+MODEL_COLORS = {
+    'Large-baseline': '#1f77b4',      # Blue
+    'Large+embed(aux)': '#2ca02c',    # Green
+    'Large+embed(noaux)': '#ff7f0e',  # Orange
+    'Small+aux': '#9467bd',           # Purple
+    'Small-noaux': '#8c564b',         # Brown
+}
 
 
 # ============================================================================
@@ -39,11 +58,17 @@ def merge_npz_files(paths, output_path):
     all_winners = []
 
     for path in paths:
+        if not os.path.exists(path):
+            print(f"  Skipping {path} (not found)")
+            continue
         data = np.load(path)
         all_moves.append(data['moves'])
         all_lengths.append(data['lengths'])
         all_winners.append(data['winners'])
         print(f"  Loaded {path}: {len(data['moves'])} games")
+
+    if not all_moves:
+        raise ValueError("No game files found!")
 
     # Handle different max_lengths by padding
     max_len = max(m.shape[1] for m in all_moves)
@@ -66,12 +91,53 @@ def merge_npz_files(paths, output_path):
 
 
 # ============================================================================
-# Training with Probing
+# Quick Validation
+# ============================================================================
+
+def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5):
+    """Fast validation on a small subset (~1000 samples).
+
+    Returns unbiased estimate of validation loss.
+    Takes ~1-2 seconds.
+
+    Args:
+        model: Model to evaluate
+        val_loader: Validation data loader
+        device: Device for evaluation
+        use_auxiliary: Whether to include sector loss
+        n_batches: Number of batches to evaluate (default 5 = ~1000 samples)
+
+    Returns:
+        float: Average loss over sampled batches
+    """
+    model.eval()
+    total_loss = 0.0
+    n_samples = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if i >= n_batches:
+                break
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            value_pred, policy_logits, sector_pred = model(batch['tokens'], batch['mask'])
+            loss, _, _, _ = compute_losses(
+                value_pred, policy_logits, sector_pred,
+                batch, use_auxiliary=use_auxiliary)
+            total_loss += loss.item() * len(batch['tokens'])
+            n_samples += len(batch['tokens'])
+
+    return total_loss / n_samples if n_samples > 0 else 0.0
+
+
+# ============================================================================
+# Training with Probing and Step Logging
 # ============================================================================
 
 def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                       use_auxiliary, device, probe_interval=1000,
-                      checkpoint_dir='checkpoints'):
+                      quick_val_interval=500, train_log_interval=100,
+                      checkpoint_dir='checkpoints', all_histories=None,
+                      plots_dir='plots'):
     """Train model and collect probe R² periodically.
 
     Args:
@@ -83,15 +149,19 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         use_auxiliary: Whether to use auxiliary sector loss
         device: Training device
         probe_interval: Steps between probe evaluations
+        quick_val_interval: Steps between quick validation checks
+        train_log_interval: Steps between training loss logs
         checkpoint_dir: Where to save checkpoints
+        all_histories: Dict of all histories (for incremental plot updates)
+        plots_dir: Where to save plots
 
     Returns:
         Dict with training history and probe results
     """
-    from training import compute_losses
     from config import LR, WEIGHT_DECAY
 
     os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
 
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -99,24 +169,30 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
     total_steps = n_epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-    # History tracking
+    # History tracking with step-level detail
     history = {
-        'train_loss': [],
-        'val_loss': [],
+        'train_loss': [],               # Epoch-end train loss
+        'val_loss': [],                 # Epoch-end val loss
         'val_value_loss': [],
         'val_policy_loss': [],
         'val_sector_loss': [],
-        'steps': [],
+        'steps': [],                    # Step count at epoch end
+        'step_train_loss': [],          # (step, loss) tuples every train_log_interval
+        'step_val_loss': [],            # (step, loss) tuples every quick_val_interval
         'probe_steps': [],
         'probe_r2': defaultdict(list),  # layer_idx -> list of R² values
+        'model_name': model_name,
+        'use_auxiliary': use_auxiliary,
     }
 
     global_step = 0
     best_val_loss = float('inf')
+    recent_losses = []  # For smoothed train loss logging
 
     print(f"\nTraining {model_name}...")
     print(f"  Parameters: {count_parameters(model):,}")
     print(f"  Epochs: {n_epochs}, Steps/epoch: {len(train_loader)}, Total: {total_steps}")
+    print(f"  Auxiliary task: {use_auxiliary}")
 
     for epoch in range(n_epochs):
         model.train()
@@ -143,14 +219,30 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
             epoch_loss += total_loss.item() * len(batch['tokens'])
             epoch_samples += len(batch['tokens'])
             global_step += 1
+            recent_losses.append(total_loss.item())
 
-            # Update progress bar (show total weighted loss + components)
+            # Update progress bar
             postfix = {'loss': f'{total_loss.item():.3f}', 'v': f'{v_loss.item():.3f}', 'p': f'{p_loss.item():.2f}'}
             if use_auxiliary:
                 postfix['s'] = f'{s_loss.item():.2f}'
             pbar.set_postfix(postfix)
 
-            # Probe evaluation
+            # Log training loss every train_log_interval steps
+            if global_step % train_log_interval == 0:
+                avg_loss = sum(recent_losses[-train_log_interval:]) / len(recent_losses[-train_log_interval:])
+                history['step_train_loss'].append((global_step, avg_loss))
+
+            # Quick validation every quick_val_interval steps
+            if global_step % quick_val_interval == 0:
+                quick_loss = quick_validate(model, val_loader, device, use_auxiliary=use_auxiliary)
+                history['step_val_loss'].append((global_step, quick_loss))
+                model.train()
+
+                # Update plots incrementally
+                if all_histories is not None:
+                    update_plots_incrementally(all_histories, plots_dir)
+
+            # Probe evaluation every probe_interval steps
             if global_step % probe_interval == 0:
                 model.eval()
                 probes = train_probes_all_layers(model, val_loader, n_samples=1000,
@@ -160,6 +252,10 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                     history['probe_r2'][layer_idx].append(probe.val_r2)
                 model.train()
 
+                # Update probe plots
+                if all_histories is not None:
+                    update_probe_plot_incrementally(all_histories, plots_dir)
+
         pbar.close()
 
         # End of epoch
@@ -167,7 +263,7 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         history['train_loss'].append(train_loss)
         history['steps'].append(global_step)
 
-        # Validation
+        # Full validation at epoch end
         model.eval()
         val_metrics = evaluate(model, val_loader, device, use_auxiliary=use_auxiliary)
         history['val_loss'].append(val_metrics['loss'])
@@ -194,11 +290,206 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
 
 
 # ============================================================================
-# Visualization
+# Incremental Visualization
 # ============================================================================
 
+def update_plots_incrementally(all_histories, plots_dir='plots'):
+    """Update loss curve plots as training progresses.
+
+    This function can be called during training to update plots
+    that you can check by opening the images.
+
+    Args:
+        all_histories: Dict mapping model_name -> history dict
+        plots_dir: Directory to save plots
+    """
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Group histories by model type for averaging
+    type_histories = {
+        'Large-baseline': [],
+        'Large+embed(aux)': [],
+        'Large+embed(noaux)': [],
+    }
+
+    for name, hist in all_histories.items():
+        for type_name in type_histories.keys():
+            if type_name in name:
+                type_histories[type_name].append(hist)
+                break
+
+    # Create figure with two subplots: train loss and val loss
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot training loss (left subplot)
+    ax = axes[0]
+    for type_name, hists in type_histories.items():
+        if not hists:
+            continue
+        color = MODEL_COLORS.get(type_name, 'gray')
+
+        # Plot individual models (translucent)
+        for hist in hists:
+            if 'step_train_loss' in hist and hist['step_train_loss']:
+                steps, losses = zip(*hist['step_train_loss'])
+                ax.plot(steps, losses, color=color, alpha=0.3, linewidth=1)
+
+        # Plot average (opaque) if we have multiple models
+        if len(hists) > 1:
+            # Find common steps across all models
+            all_steps = set()
+            for hist in hists:
+                if 'step_train_loss' in hist:
+                    all_steps.update(s for s, _ in hist['step_train_loss'])
+            all_steps = sorted(all_steps)
+
+            if all_steps:
+                avg_losses = []
+                for step in all_steps:
+                    losses_at_step = []
+                    for hist in hists:
+                        step_dict = dict(hist.get('step_train_loss', []))
+                        if step in step_dict:
+                            losses_at_step.append(step_dict[step])
+                    if losses_at_step:
+                        avg_losses.append(np.mean(losses_at_step))
+                    else:
+                        avg_losses.append(np.nan)
+
+                ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Training Loss')
+    ax.set_title('Training Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Plot validation loss (right subplot)
+    ax = axes[1]
+    for type_name, hists in type_histories.items():
+        if not hists:
+            continue
+        color = MODEL_COLORS.get(type_name, 'gray')
+
+        # Plot individual models (translucent)
+        for hist in hists:
+            if 'step_val_loss' in hist and hist['step_val_loss']:
+                steps, losses = zip(*hist['step_val_loss'])
+                ax.plot(steps, losses, color=color, alpha=0.3, linewidth=1)
+
+        # Plot average (opaque) if we have multiple models
+        if len(hists) > 1:
+            all_steps = set()
+            for hist in hists:
+                if 'step_val_loss' in hist:
+                    all_steps.update(s for s, _ in hist['step_val_loss'])
+            all_steps = sorted(all_steps)
+
+            if all_steps:
+                avg_losses = []
+                for step in all_steps:
+                    losses_at_step = []
+                    for hist in hists:
+                        step_dict = dict(hist.get('step_val_loss', []))
+                        if step in step_dict:
+                            losses_at_step.append(step_dict[step])
+                    if losses_at_step:
+                        avg_losses.append(np.mean(losses_at_step))
+                    else:
+                        avg_losses.append(np.nan)
+
+                ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Validation Loss')
+    ax.set_title('Validation Loss (Quick Samples)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, 'loss_curves_live.png'), dpi=150)
+    plt.close()
+
+
+def update_probe_plot_incrementally(all_histories, plots_dir='plots'):
+    """Update probe R² plot as training progresses.
+
+    Args:
+        all_histories: Dict mapping model_name -> history dict
+        plots_dir: Directory to save plots
+    """
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Focus on layer 2 (the last embedded layer) for the main comparison
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    type_histories = {
+        'Large-baseline': [],
+        'Large+embed(aux)': [],
+        'Large+embed(noaux)': [],
+    }
+
+    for name, hist in all_histories.items():
+        for type_name in type_histories.keys():
+            if type_name in name:
+                type_histories[type_name].append(hist)
+                break
+
+    target_layer = 2  # The last embedded layer
+
+    for type_name, hists in type_histories.items():
+        if not hists:
+            continue
+        color = MODEL_COLORS.get(type_name, 'gray')
+
+        # Plot individual models (translucent)
+        for hist in hists:
+            probe_steps = hist.get('probe_steps', [])
+            probe_r2 = hist.get('probe_r2', {})
+            if target_layer in probe_r2 and probe_steps:
+                ax.plot(probe_steps, probe_r2[target_layer],
+                       color=color, alpha=0.3, linewidth=1, marker='o', markersize=2)
+
+        # Plot average (opaque) if we have multiple models
+        if len(hists) > 1:
+            all_steps = set()
+            for hist in hists:
+                all_steps.update(hist.get('probe_steps', []))
+            all_steps = sorted(all_steps)
+
+            if all_steps:
+                avg_r2 = []
+                for step in all_steps:
+                    r2_at_step = []
+                    for hist in hists:
+                        probe_steps = hist.get('probe_steps', [])
+                        probe_r2 = hist.get('probe_r2', {})
+                        if step in probe_steps and target_layer in probe_r2:
+                            idx = probe_steps.index(step)
+                            if idx < len(probe_r2[target_layer]):
+                                r2_at_step.append(probe_r2[target_layer][idx])
+                    if r2_at_step:
+                        avg_r2.append(np.mean(r2_at_step))
+                    else:
+                        avg_r2.append(np.nan)
+
+                ax.plot(all_steps, avg_r2, color=color, alpha=1.0, linewidth=2,
+                       label=type_name, marker='o', markersize=3)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Probe R²')
+    ax.set_title(f'Probe R² at Layer {target_layer} (Last Embedded Layer)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, 'probe_r2_live.png'), dpi=150)
+    plt.close()
+
+
 def plot_loss_curves(histories, output_path='plots/loss_curves.png'):
-    """Plot training and validation loss curves for all models."""
+    """Plot final training and validation loss curves for all models."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -314,20 +605,177 @@ def plot_final_probe_comparison(histories, output_path='plots/probe_final.png'):
 
 
 # ============================================================================
-# Main Experiment
+# Main Experiment - Single Seed
 # ============================================================================
 
-def run_experiment(phase0_path='data/phase0_games.npz',
-                   selfplay_path='data/selfplay_games.npz',
-                   n_epochs=3, seed=42, device='cuda',
-                   probe_interval=1000):
-    """Run the full embedding experiment.
+def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
+                    probe_interval, all_histories, checkpoint_dir='checkpoints',
+                    plots_dir='plots'):
+    """Run experiment for a single seed.
+
+    Args:
+        seed: Random seed
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        n_epochs: Epochs per model
+        device: Training device
+        probe_interval: Steps between probe evaluations
+        all_histories: Dict to accumulate all histories
+        checkpoint_dir: Where to save checkpoints
+        plots_dir: Where to save plots
+
+    Returns:
+        Dict with histories for this seed
+    """
+    seed_histories = {}
+
+    # -------------------------------------------------------------------------
+    # Train Small+aux
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Small+aux...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    small_aux = create_small_model()
+    model_name = f'small_aux_s{seed}'
+    hist = train_with_probes(
+        small_aux, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=True, device=device,
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Small+aux'] = hist
+    all_histories[f'Small+aux_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # Train Small-noaux
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Small-noaux...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    small_noaux = create_small_model()
+    model_name = f'small_noaux_s{seed}'
+    hist = train_with_probes(
+        small_noaux, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Small-noaux'] = hist
+    all_histories[f'Small-noaux_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # Train Large-baseline (NO auxiliary task)
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Large-baseline (no aux)...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    large_baseline = create_large_model()
+    model_name = f'large_baseline_s{seed}'
+    hist = train_with_probes(
+        large_baseline, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Large-baseline'] = hist
+    all_histories[f'Large-baseline_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # Train Large+embed(small+aux) (NO auxiliary task)
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Large+embed(aux) (no aux training)...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    large_embed_aux = create_large_model()
+
+    # Reload small+aux weights
+    small_aux_fresh = create_small_model()
+    small_aux_fresh.load_state_dict(
+        torch.load(f'{checkpoint_dir}/small_aux_s{seed}_best.pt', weights_only=True)
+    )
+
+    # Embed
+    embed_small_into_large(small_aux_fresh, large_embed_aux)
+
+    # Verify embedding
+    tokens = torch.randint(0, 2, (4, 257))
+    tokens[:, -1] = 2
+    verify_result = verify_embedding(small_aux_fresh, large_embed_aux, tokens)
+    max_diff = max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff'])
+    print(f"  Embedding verified: max diff = {max_diff:.2e}")
+
+    model_name = f'large_embed_aux_s{seed}'
+    hist = train_with_probes(
+        large_embed_aux, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Large+embed(aux)'] = hist
+    all_histories[f'Large+embed(aux)_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # Train Large+embed(small-noaux) (NO auxiliary task)
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Large+embed(noaux) (no aux training)...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    large_embed_noaux = create_large_model()
+
+    # Reload small-noaux weights
+    small_noaux_fresh = create_small_model()
+    small_noaux_fresh.load_state_dict(
+        torch.load(f'{checkpoint_dir}/small_noaux_s{seed}_best.pt', weights_only=True)
+    )
+
+    # Embed
+    embed_small_into_large(small_noaux_fresh, large_embed_noaux)
+
+    # Verify
+    verify_result = verify_embedding(small_noaux_fresh, large_embed_noaux, tokens)
+    max_diff = max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff'])
+    print(f"  Embedding verified: max diff = {max_diff:.2e}")
+
+    model_name = f'large_embed_noaux_s{seed}'
+    hist = train_with_probes(
+        large_embed_noaux, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Large+embed(noaux)'] = hist
+    all_histories[f'Large+embed(noaux)_s{seed}'] = hist
+
+    return seed_histories
+
+
+# ============================================================================
+# Full Experiment - Multiple Seeds
+# ============================================================================
+
+def run_full_experiment(phase0_path='data/phase0_games.npz',
+                        selfplay_path='data/selfplay_games.npz',
+                        additional_selfplay_path='data/selfplay_additional.npz',
+                        n_epochs=3, seeds=[42, 123, 456], device='cuda',
+                        probe_interval=1000):
+    """Run the full embedding experiment across multiple seeds.
 
     Args:
         phase0_path: Path to phase0 games
         selfplay_path: Path to selfplay games
+        additional_selfplay_path: Path to additional selfplay games (optional)
         n_epochs: Epochs per model
-        seed: Random seed
+        seeds: List of random seeds
         device: Training device
         probe_interval: Steps between probe evaluations
 
@@ -337,24 +785,26 @@ def run_experiment(phase0_path='data/phase0_games.npz',
     print("=" * 60)
     print("EMBEDDING EXPERIMENT")
     print("=" * 60)
+    print(f"Seeds: {seeds}")
+    print(f"Epochs: {n_epochs}")
+    print(f"Probe interval: {probe_interval}")
 
     start_time = time.time()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
 
     # -------------------------------------------------------------------------
     # Step 1: Prepare data
     # -------------------------------------------------------------------------
-    print("\n[1/6] Preparing data...")
+    print("\n[1/2] Preparing data...")
 
     combined_path = 'data/combined_for_experiment.npz'
-    if not os.path.exists(combined_path):
-        merge_npz_files([phase0_path, selfplay_path], combined_path)
-    else:
-        print(f"  Using existing {combined_path}")
+    data_files = [phase0_path, selfplay_path]
+    if os.path.exists(additional_selfplay_path):
+        data_files.append(additional_selfplay_path)
+
+    # Always regenerate to pick up any new data
+    merge_npz_files(data_files, combined_path)
 
     # Create data loaders
-    # Use more positions per game for large models (~116 avg positions/game available)
     train_dataset = DomineeringDataset(combined_path, split='train', positions_per_game=60)
     val_dataset = DomineeringDataset(combined_path, split='val', positions_per_game=20)
 
@@ -368,145 +818,133 @@ def run_experiment(phase0_path='data/phase0_games.npz',
 
     print(f"  Train: {len(train_dataset)} positions, Val: {len(val_dataset)} positions")
 
-    histories = {}
+    # -------------------------------------------------------------------------
+    # Step 2: Train models across seeds
+    # -------------------------------------------------------------------------
+    print("\n[2/2] Training models...")
+
+    all_histories = {}
+
+    for i, seed in enumerate(seeds):
+        print(f"\n{'='*60}")
+        print(f"SEED {seed} ({i+1}/{len(seeds)})")
+        print("=" * 60)
+
+        run_single_seed(
+            seed=seed,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            n_epochs=n_epochs,
+            device=device,
+            probe_interval=probe_interval,
+            all_histories=all_histories,
+            checkpoint_dir='checkpoints',
+            plots_dir='plots'
+        )
+
+        # Save intermediate results
+        save_histories(all_histories, 'results/histories.json')
 
     # -------------------------------------------------------------------------
-    # Step 2: Train Small+aux
-    # -------------------------------------------------------------------------
-    print("\n[2/6] Training Small+aux...")
-    small_aux = create_small_model()
-    histories['Small+aux'] = train_with_probes(
-        small_aux, train_loader, val_loader, n_epochs,
-        model_name='small_aux', use_auxiliary=True, device=device,
-        probe_interval=probe_interval
-    )
-
-    # -------------------------------------------------------------------------
-    # Step 3: Train Small-noaux
-    # -------------------------------------------------------------------------
-    print("\n[3/6] Training Small-noaux...")
-    torch.manual_seed(seed)  # Reset seed for fair comparison
-    small_noaux = create_small_model()
-    histories['Small-noaux'] = train_with_probes(
-        small_noaux, train_loader, val_loader, n_epochs,
-        model_name='small_noaux', use_auxiliary=False, device=device,
-        probe_interval=probe_interval
-    )
-
-    # -------------------------------------------------------------------------
-    # Step 4: Train Large baseline
-    # -------------------------------------------------------------------------
-    print("\n[4/6] Training Large-baseline...")
-    torch.manual_seed(seed)
-    large_baseline = create_large_model()
-    histories['Large-baseline'] = train_with_probes(
-        large_baseline, train_loader, val_loader, n_epochs,
-        model_name='large_baseline', use_auxiliary=True, device=device,
-        probe_interval=probe_interval
-    )
-
-    # -------------------------------------------------------------------------
-    # Step 5: Train Large+embed(small+aux)
-    # -------------------------------------------------------------------------
-    print("\n[5/6] Training Large+embed(small+aux)...")
-    torch.manual_seed(seed)
-    large_embed_aux = create_large_model()
-
-    # Reload small+aux weights
-    small_aux_fresh = create_small_model()
-    small_aux_fresh.load_state_dict(torch.load('checkpoints/small_aux_best.pt', weights_only=True))
-
-    # Embed
-    embed_small_into_large(small_aux_fresh, large_embed_aux)
-
-    # Verify embedding
-    tokens = torch.randint(0, 2, (4, 257))
-    tokens[:, -1] = 2
-    verify_result = verify_embedding(small_aux_fresh, large_embed_aux, tokens)
-    print(f"  Embedding verified: max diff = {max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff']):.2e}")
-
-    histories['Large+embed(aux)'] = train_with_probes(
-        large_embed_aux, train_loader, val_loader, n_epochs,
-        model_name='large_embed_aux', use_auxiliary=True, device=device,
-        probe_interval=probe_interval
-    )
-
-    # -------------------------------------------------------------------------
-    # Step 6: Train Large+embed(small-noaux)
-    # -------------------------------------------------------------------------
-    print("\n[6/6] Training Large+embed(small-noaux)...")
-    torch.manual_seed(seed)
-    large_embed_noaux = create_large_model()
-
-    # Reload small-noaux weights
-    small_noaux_fresh = create_small_model()
-    small_noaux_fresh.load_state_dict(torch.load('checkpoints/small_noaux_best.pt', weights_only=True))
-
-    # Embed
-    embed_small_into_large(small_noaux_fresh, large_embed_noaux)
-
-    # Verify
-    verify_result = verify_embedding(small_noaux_fresh, large_embed_noaux, tokens)
-    print(f"  Embedding verified: max diff = {max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff']):.2e}")
-
-    histories['Large+embed(noaux)'] = train_with_probes(
-        large_embed_noaux, train_loader, val_loader, n_epochs,
-        model_name='large_embed_noaux', use_auxiliary=True, device=device,
-        probe_interval=probe_interval
-    )
-
-    # -------------------------------------------------------------------------
-    # Generate visualizations
+    # Generate final visualizations
     # -------------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
 
-    plot_loss_curves(histories)
-    plot_probe_r2(histories)
-    plot_final_probe_comparison(histories)
+    plot_loss_curves(all_histories)
+    plot_probe_r2(all_histories)
+    plot_final_probe_comparison(all_histories)
+    update_plots_incrementally(all_histories)
+    update_probe_plot_incrementally(all_histories)
 
     # Print summary
     print("\nFinal Validation Loss:")
     print("-" * 40)
-    for name, hist in histories.items():
-        print(f"  {name:25}: {hist['val_loss'][-1]:.4f}")
+    for name, hist in sorted(all_histories.items()):
+        if hist['val_loss']:
+            print(f"  {name:30}: {hist['val_loss'][-1]:.4f}")
 
-    print("\nFinal Probe R² (layers 0, 1, final):")
+    print("\nFinal Probe R² at Layer 2 (embedded layer):")
     print("-" * 60)
-    for name, hist in histories.items():
-        if 'final_probes' in hist:
-            probes = hist['final_probes']
-            r2_0 = probes.get(0, type('', (), {'val_r2': 0})()).val_r2 if 0 in probes else 0
-            r2_1 = probes.get(1, type('', (), {'val_r2': 0})()).val_r2 if 1 in probes else 0
-            r2_f = probes.get(-1, type('', (), {'val_r2': 0})()).val_r2 if -1 in probes else 0
-            print(f"  {name:25}: L0={r2_0:.4f}, L1={r2_1:.4f}, Final={r2_f:.4f}")
+    for name, hist in sorted(all_histories.items()):
+        if 'final_probes' in hist and 2 in hist['final_probes']:
+            r2 = hist['final_probes'][2].val_r2
+            print(f"  {name:30}: {r2:.4f}")
 
     elapsed = time.time() - start_time
-    print(f"\nTotal time: {elapsed/60:.1f} minutes")
+    print(f"\nTotal time: {elapsed/60:.1f} minutes ({elapsed/3600:.1f} hours)")
 
-    return histories
+    return all_histories
+
+
+def save_histories(histories, path):
+    """Save histories to JSON file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Convert to JSON-serializable format
+    serializable = {}
+    for name, hist in histories.items():
+        s_hist = {}
+        for k, v in hist.items():
+            if k == 'final_probes':
+                s_hist[k] = {str(layer): {'val_r2': p.val_r2, 'train_r2': p.train_r2}
+                            for layer, p in v.items()}
+            elif k == 'probe_r2':
+                s_hist[k] = {str(layer): list(r2s) for layer, r2s in v.items()}
+            elif isinstance(v, defaultdict):
+                s_hist[k] = dict(v)
+            else:
+                s_hist[k] = v
+        serializable[name] = s_hist
+
+    with open(path, 'w') as f:
+        json.dump(serializable, f, indent=2)
+
+
+# ============================================================================
+# Legacy single-seed experiment (for compatibility)
+# ============================================================================
+
+def run_experiment(phase0_path='data/phase0_games.npz',
+                   selfplay_path='data/selfplay_games.npz',
+                   n_epochs=3, seed=42, device='cuda',
+                   probe_interval=1000):
+    """Run single-seed experiment (legacy compatibility)."""
+    return run_full_experiment(
+        phase0_path=phase0_path,
+        selfplay_path=selfplay_path,
+        n_epochs=n_epochs,
+        seeds=[seed],
+        device=device,
+        probe_interval=probe_interval
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description='Run embedding experiment')
     parser.add_argument('--phase0', type=str, default='data/phase0_games.npz')
     parser.add_argument('--selfplay', type=str, default='data/selfplay_games.npz')
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--additional-selfplay', type=str, default='data/selfplay_additional.npz')
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--seeds', type=str, default='42,123,456',
+                        help='Comma-separated list of seeds')
     parser.add_argument('--probe-interval', type=int, default=1000,
                         help='Steps between probe evaluations')
 
     args = parser.parse_args()
 
+    seeds = [int(s.strip()) for s in args.seeds.split(',')]
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    run_experiment(
+    run_full_experiment(
         phase0_path=args.phase0,
         selfplay_path=args.selfplay,
+        additional_selfplay_path=args.additional_selfplay,
         n_epochs=args.epochs,
-        seed=args.seed,
+        seeds=seeds,
         device=device,
         probe_interval=args.probe_interval
     )
