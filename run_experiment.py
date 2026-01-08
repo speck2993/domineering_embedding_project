@@ -203,6 +203,24 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         'use_auxiliary': use_auxiliary,
     }
 
+    # Add history to all_histories immediately so plots update during training
+    # Convert model_name to display format for plot matching
+    if all_histories is not None:
+        # Map: large_baseline_s42 -> Large-baseline_s42, etc.
+        if 'large_baseline' in model_name:
+            display_name = model_name.replace('large_baseline', 'Large-baseline')
+        elif 'large_embed_noaux' in model_name:
+            display_name = model_name.replace('large_embed_noaux', 'Large+embed(noaux)')
+        elif 'large_embed_aux' in model_name:
+            display_name = model_name.replace('large_embed_aux', 'Large+embed(aux)')
+        elif 'small_noaux' in model_name:
+            display_name = model_name.replace('small_noaux', 'Small-noaux')
+        elif 'small_aux' in model_name:
+            display_name = model_name.replace('small_aux', 'Small+aux')
+        else:
+            display_name = model_name
+        all_histories[display_name] = history
+
     global_step = 0
     best_val_loss = float('inf')
     recent_losses = []  # For smoothed train loss logging
