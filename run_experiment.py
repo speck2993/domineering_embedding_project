@@ -94,18 +94,18 @@ def merge_npz_files(paths, output_path):
 # Quick Validation
 # ============================================================================
 
-def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5, step=None):
-    """Fast validation on a small subset (~1000 samples).
+def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=10, step=None):
+    """Fast validation on a small subset (~2000 samples).
 
     Returns unbiased estimate of validation loss.
-    Takes ~1-2 seconds.
+    Takes ~2-3 seconds.
 
     Args:
         model: Model to evaluate
         val_loader: Validation data loader
         device: Device for evaluation
         use_auxiliary: Whether to include sector loss
-        n_batches: Number of batches to evaluate (default 5 = ~1000 samples)
+        n_batches: Number of batches to evaluate (default 10 = ~2000 samples)
         step: If provided, seeds batch selection so all models at the same step
               evaluate on the same random batches (for fair comparison)
 
@@ -655,32 +655,13 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
         val_loader_small = val_loader
     seed_histories = {}
 
-    # Training order designed for quick time estimation:
-    # 1. Large baseline first (gives immediate sense of large model training time)
-    # 2. Small noaux -> Large embed noaux (noaux pair)
-    # 3. Small aux -> Large embed aux (aux pair)
+    # Training order: small models first (to monitor memory), baseline last
+    # 1. Small noaux -> Large embed noaux (noaux pair)
+    # 2. Small aux -> Large embed aux (aux pair)
+    # 3. Large baseline (last)
 
     # -------------------------------------------------------------------------
-    # 1. Train Large-baseline (NO auxiliary task)
-    # -------------------------------------------------------------------------
-    print(f"\n[Seed {seed}] Training Large-baseline (no aux)...")
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    large_baseline = create_large_model()
-    model_name = f'large_baseline_s{seed}'
-    hist = train_with_probes(
-        large_baseline, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=False, device=device,
-        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
-        all_histories=all_histories, plots_dir=plots_dir
-    )
-    seed_histories['Large-baseline'] = hist
-    all_histories[f'Large-baseline_s{seed}'] = hist
-
-    # -------------------------------------------------------------------------
-    # 2a. Train Small-noaux
+    # 1a. Train Small-noaux
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Small-noaux...")
     torch.manual_seed(seed)
@@ -697,9 +678,10 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     )
     seed_histories['Small-noaux'] = hist
     all_histories[f'Small-noaux_s{seed}'] = hist
+    save_histories(all_histories, 'results/histories.json')
 
     # -------------------------------------------------------------------------
-    # 2b. Train Large+embed(small-noaux) (NO auxiliary task)
+    # 1b. Train Large+embed(small-noaux) (NO auxiliary task)
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Large+embed(noaux) (no aux training)...")
     torch.manual_seed(seed)
@@ -733,9 +715,10 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     )
     seed_histories['Large+embed(noaux)'] = hist
     all_histories[f'Large+embed(noaux)_s{seed}'] = hist
+    save_histories(all_histories, 'results/histories.json')
 
     # -------------------------------------------------------------------------
-    # 3a. Train Small+aux
+    # 2a. Train Small+aux
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Small+aux...")
     torch.manual_seed(seed)
@@ -752,9 +735,10 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     )
     seed_histories['Small+aux'] = hist
     all_histories[f'Small+aux_s{seed}'] = hist
+    save_histories(all_histories, 'results/histories.json')
 
     # -------------------------------------------------------------------------
-    # 3b. Train Large+embed(small+aux) (NO auxiliary task)
+    # 2b. Train Large+embed(small+aux) (NO auxiliary task)
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Large+embed(aux) (no aux training)...")
     torch.manual_seed(seed)
@@ -786,6 +770,27 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     )
     seed_histories['Large+embed(aux)'] = hist
     all_histories[f'Large+embed(aux)_s{seed}'] = hist
+    save_histories(all_histories, 'results/histories.json')
+
+    # -------------------------------------------------------------------------
+    # 3. Train Large-baseline (NO auxiliary task) - last for memory monitoring
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Large-baseline (no aux)...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    large_baseline = create_large_model()
+    model_name = f'large_baseline_s{seed}'
+    hist = train_with_probes(
+        large_baseline, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Large-baseline'] = hist
+    all_histories[f'Large-baseline_s{seed}'] = hist
+    save_histories(all_histories, 'results/histories.json')
 
     return seed_histories
 
@@ -837,7 +842,7 @@ def run_full_experiment(phase0_path='data/phase0_games.npz',
 
     # Create data loaders
     # Use EfficientDomineeringDataset for both (precomputes positions)
-    train_dataset = EfficientDomineeringDataset(combined_path, split='train', positions_per_game=60)
+    train_dataset = EfficientDomineeringDataset(combined_path, split='train', positions_per_game=57)  # 5% less for speed
     val_dataset = EfficientDomineeringDataset(combined_path, split='val', positions_per_game=20)
 
     # Precompute positions now (before creating DataLoader)

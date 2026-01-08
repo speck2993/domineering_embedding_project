@@ -378,15 +378,15 @@ def run_dry_run():
         seed = 999
 
         # Training order matches run_experiment.py:
-        # 1. Large baseline (for time estimation)
-        # 2. Small noaux -> Large embed noaux
-        # 3. Small aux -> Large embed aux
+        # 1. Small noaux -> Large embed noaux
+        # 2. Small aux -> Large embed aux
+        # 3. Large baseline (last, for memory monitoring)
         models_to_train = [
-            ('large_baseline', False, False),   # (name_suffix, is_small, use_aux)
-            ('small_noaux', True, False),
+            ('small_noaux', True, False),       # (name_suffix, is_small, use_aux)
             ('large_embed_noaux', False, False),
             ('small_aux', True, True),
             ('large_embed_aux', False, False),
+            ('large_baseline', False, False),
         ]
 
         for name_suffix, is_small, use_aux in models_to_train:

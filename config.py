@@ -33,10 +33,10 @@ N_POLICY = 480      # move outputs
 N_SECTORS = 16      # auxiliary task outputs
 
 # Training hyperparameters (for later sections)
-LR = 2e-4
+LR = 2.3e-4  # Bumped 15% for faster convergence
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 200
-SMALL_BATCH_SIZE = 500  # Larger batch for small models (faster training)
+SMALL_BATCH_SIZE = 400  # Larger batch for small models (faster training)
 
 # Loss weights
 # Value loss (BCE) is ~0.5-0.7, policy loss (CE over 480 classes) is ~3-4
