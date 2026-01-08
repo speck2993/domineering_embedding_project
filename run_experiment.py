@@ -470,7 +470,9 @@ def update_probe_plot_incrementally(all_histories, plots_dir='plots'):
     if ax.get_legend_handles_labels()[0]:  # Only add legend if there are labeled artists
         ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(0, 1)
+    # Auto-scale y-axis but ensure 0 and 1 are visible for reference
+    y_min, y_max = ax.get_ylim()
+    ax.set_ylim(min(y_min, -0.1), max(y_max, 1.0))
 
     plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, 'probe_r2_live.png'), dpi=150)
