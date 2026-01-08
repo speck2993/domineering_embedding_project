@@ -94,18 +94,18 @@ def merge_npz_files(paths, output_path):
 # Quick Validation
 # ============================================================================
 
-def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=10, step=None):
-    """Fast validation on a small subset (~2000 samples).
+def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=25, step=None):
+    """Fast validation on a small subset (~5000 samples).
 
     Returns unbiased estimate of validation loss.
-    Takes ~2-3 seconds.
+    Takes ~5-6 seconds.
 
     Args:
         model: Model to evaluate
         val_loader: Validation data loader
         device: Device for evaluation
         use_auxiliary: Whether to include sector loss
-        n_batches: Number of batches to evaluate (default 10 = ~2000 samples)
+        n_batches: Number of batches to evaluate (default 25 = ~5000 samples)
         step: If provided, seeds batch selection so all models at the same step
               evaluate on the same random batches (for fair comparison)
 
@@ -151,7 +151,7 @@ def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=10,
 
 def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                       use_auxiliary, device, probe_interval=1000,
-                      quick_val_interval=500, train_log_interval=100,
+                      quick_val_interval=800, train_log_interval=100,
                       checkpoint_dir='checkpoints', all_histories=None,
                       plots_dir='plots'):
     """Train model and collect probe R² periodically.
@@ -165,7 +165,7 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         use_auxiliary: Whether to use auxiliary sector loss
         device: Training device
         probe_interval: Steps between probe evaluations
-        quick_val_interval: Steps between quick validation checks
+        quick_val_interval: Steps between quick validation checks (default 800)
         train_log_interval: Steps between training loss logs
         checkpoint_dir: Where to save checkpoints
         all_histories: Dict of all histories (for incremental plot updates)
@@ -197,6 +197,7 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         'steps': [],                    # Step count at epoch end
         'step_train_loss': [],          # (step, loss) tuples every train_log_interval
         'step_val_loss': [],            # (step, loss) tuples every quick_val_interval
+        'epoch_val_loss': [],           # (step, loss) tuples for full validation at epoch end (large models only)
         'probe_steps': [],
         'probe_r2': defaultdict(list),  # layer_idx -> list of R² values
         'model_name': model_name,
@@ -309,6 +310,13 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
         history['val_value_loss'].append(val_metrics['value_loss'])
         history['val_policy_loss'].append(val_metrics['policy_loss'])
         history['val_sector_loss'].append(val_metrics['sector_loss'])
+
+        # Store epoch-end full validation for plotting with X markers (large models only)
+        if is_large_model:
+            history['epoch_val_loss'].append((global_step, val_metrics['loss']))
+            # Update plots to show the new epoch marker
+            if all_histories is not None:
+                update_plots_incrementally(all_histories, plots_dir)
 
         print(f"  Val: loss={val_metrics['loss']:.4f}, v_acc={val_metrics['value_acc']:.1%}, p_acc={val_metrics['policy_acc']:.1%}")
 
@@ -425,9 +433,28 @@ def update_plots_incrementally(all_histories, plots_dir='plots'):
                 avg_losses.append(np.mean(vals) if vals else np.nan)
             ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
 
+        # Plot epoch-end full validation with X markers (individual models, translucent)
+        for hist in hists:
+            if 'epoch_val_loss' in hist and hist['epoch_val_loss']:
+                steps, losses = zip(*hist['epoch_val_loss'])
+                ax.scatter(steps, losses, color=color, alpha=0.4, marker='x', s=60, linewidths=2)
+
+        # Plot averaged epoch-end full validation with X markers (opaque)
+        all_epoch_data = []
+        for hist in hists:
+            if 'epoch_val_loss' in hist and hist['epoch_val_loss']:
+                all_epoch_data.append(dict(hist['epoch_val_loss']))
+        if all_epoch_data:
+            all_epoch_steps = sorted(set().union(*[d.keys() for d in all_epoch_data]))
+            avg_epoch_losses = []
+            for step in all_epoch_steps:
+                vals = [d[step] for d in all_epoch_data if step in d]
+                avg_epoch_losses.append(np.mean(vals) if vals else np.nan)
+            ax.scatter(all_epoch_steps, avg_epoch_losses, color=color, alpha=1.0, marker='x', s=100, linewidths=2.5)
+
     ax.set_xlabel('Training Step')
     ax.set_ylabel('Validation Loss')
-    ax.set_title('Validation Loss (Quick Samples)')
+    ax.set_title('Validation Loss (Quick Samples, X=Full Epoch)')
     if ax.get_legend_handles_labels()[0]:  # Only add legend if there are labeled artists
         ax.legend()
     ax.grid(True, alpha=0.3)
