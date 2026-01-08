@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from tqdm import tqdm
 
-from config import BATCH_SIZE, SMALL_CONFIG, LARGE_CONFIG
+from config import BATCH_SIZE, SMALL_BATCH_SIZE, SMALL_CONFIG, LARGE_CONFIG
 from model import create_small_model, create_large_model, count_parameters
 from data_loader import EfficientDomineeringDataset
 from training import train_model, collate_batch, evaluate, compute_losses
@@ -611,65 +611,39 @@ def plot_final_probe_comparison(histories, output_path='plots/probe_final.png'):
 
 def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
                     probe_interval, all_histories, checkpoint_dir='checkpoints',
-                    plots_dir='plots'):
+                    plots_dir='plots', train_loader_small=None, val_loader_small=None):
     """Run experiment for a single seed.
 
     Args:
         seed: Random seed
-        train_loader: Training data loader
-        val_loader: Validation data loader
+        train_loader: Training data loader (for large models)
+        val_loader: Validation data loader (for large models)
         n_epochs: Epochs per model
         device: Training device
         probe_interval: Steps between probe evaluations
         all_histories: Dict to accumulate all histories
         checkpoint_dir: Where to save checkpoints
         plots_dir: Where to save plots
+        train_loader_small: Training data loader for small models (larger batch)
+        val_loader_small: Validation data loader for small models (larger batch)
 
     Returns:
         Dict with histories for this seed
     """
+    # Use provided small loaders or fall back to regular loaders
+    if train_loader_small is None:
+        train_loader_small = train_loader
+    if val_loader_small is None:
+        val_loader_small = val_loader
     seed_histories = {}
 
-    # -------------------------------------------------------------------------
-    # Train Small+aux
-    # -------------------------------------------------------------------------
-    print(f"\n[Seed {seed}] Training Small+aux...")
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    small_aux = create_small_model()
-    model_name = f'small_aux_s{seed}'
-    hist = train_with_probes(
-        small_aux, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=True, device=device,
-        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
-        all_histories=all_histories, plots_dir=plots_dir
-    )
-    seed_histories['Small+aux'] = hist
-    all_histories[f'Small+aux_s{seed}'] = hist
+    # Training order designed for quick time estimation:
+    # 1. Large baseline first (gives immediate sense of large model training time)
+    # 2. Small noaux -> Large embed noaux (noaux pair)
+    # 3. Small aux -> Large embed aux (aux pair)
 
     # -------------------------------------------------------------------------
-    # Train Small-noaux
-    # -------------------------------------------------------------------------
-    print(f"\n[Seed {seed}] Training Small-noaux...")
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    small_noaux = create_small_model()
-    model_name = f'small_noaux_s{seed}'
-    hist = train_with_probes(
-        small_noaux, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=False, device=device,
-        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
-        all_histories=all_histories, plots_dir=plots_dir
-    )
-    seed_histories['Small-noaux'] = hist
-    all_histories[f'Small-noaux_s{seed}'] = hist
-
-    # -------------------------------------------------------------------------
-    # Train Large-baseline (NO auxiliary task)
+    # 1. Train Large-baseline (NO auxiliary task)
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Large-baseline (no aux)...")
     torch.manual_seed(seed)
@@ -680,7 +654,7 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     model_name = f'large_baseline_s{seed}'
     hist = train_with_probes(
         large_baseline, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        model_name=model_name, use_auxiliary=False, device=device,
         probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
         all_histories=all_histories, plots_dir=plots_dir
     )
@@ -688,43 +662,26 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     all_histories[f'Large-baseline_s{seed}'] = hist
 
     # -------------------------------------------------------------------------
-    # Train Large+embed(small+aux) (NO auxiliary task)
+    # 2a. Train Small-noaux
     # -------------------------------------------------------------------------
-    print(f"\n[Seed {seed}] Training Large+embed(aux) (no aux training)...")
+    print(f"\n[Seed {seed}] Training Small-noaux...")
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-    large_embed_aux = create_large_model()
-
-    # Reload small+aux weights
-    small_aux_fresh = create_small_model()
-    small_aux_fresh.load_state_dict(
-        torch.load(f'{checkpoint_dir}/small_aux_s{seed}_best.pt', weights_only=True)
-    )
-
-    # Embed
-    embed_small_into_large(small_aux_fresh, large_embed_aux)
-
-    # Verify embedding
-    tokens = torch.randint(0, 2, (4, 257))
-    tokens[:, -1] = 2
-    verify_result = verify_embedding(small_aux_fresh, large_embed_aux, tokens)
-    max_diff = max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff'])
-    print(f"  Embedding verified: max diff = {max_diff:.2e}")
-
-    model_name = f'large_embed_aux_s{seed}'
+    small_noaux = create_small_model()
+    model_name = f'small_noaux_s{seed}'
     hist = train_with_probes(
-        large_embed_aux, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        small_noaux, train_loader_small, val_loader_small, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,
         probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
         all_histories=all_histories, plots_dir=plots_dir
     )
-    seed_histories['Large+embed(aux)'] = hist
-    all_histories[f'Large+embed(aux)_s{seed}'] = hist
+    seed_histories['Small-noaux'] = hist
+    all_histories[f'Small-noaux_s{seed}'] = hist
 
     # -------------------------------------------------------------------------
-    # Train Large+embed(small-noaux) (NO auxiliary task)
+    # 2b. Train Large+embed(small-noaux) (NO auxiliary task)
     # -------------------------------------------------------------------------
     print(f"\n[Seed {seed}] Training Large+embed(noaux) (no aux training)...")
     torch.manual_seed(seed)
@@ -742,7 +699,9 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     # Embed
     embed_small_into_large(small_noaux_fresh, large_embed_noaux)
 
-    # Verify
+    # Verify embedding
+    tokens = torch.randint(0, 2, (4, 257))
+    tokens[:, -1] = 2
     verify_result = verify_embedding(small_noaux_fresh, large_embed_noaux, tokens)
     max_diff = max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff'])
     print(f"  Embedding verified: max diff = {max_diff:.2e}")
@@ -750,12 +709,65 @@ def run_single_seed(seed, train_loader, val_loader, n_epochs, device,
     model_name = f'large_embed_noaux_s{seed}'
     hist = train_with_probes(
         large_embed_noaux, train_loader, val_loader, n_epochs,
-        model_name=model_name, use_auxiliary=False, device=device,  # NO aux!
+        model_name=model_name, use_auxiliary=False, device=device,
         probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
         all_histories=all_histories, plots_dir=plots_dir
     )
     seed_histories['Large+embed(noaux)'] = hist
     all_histories[f'Large+embed(noaux)_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # 3a. Train Small+aux
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Small+aux...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    small_aux = create_small_model()
+    model_name = f'small_aux_s{seed}'
+    hist = train_with_probes(
+        small_aux, train_loader_small, val_loader_small, n_epochs,
+        model_name=model_name, use_auxiliary=True, device=device,
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Small+aux'] = hist
+    all_histories[f'Small+aux_s{seed}'] = hist
+
+    # -------------------------------------------------------------------------
+    # 3b. Train Large+embed(small+aux) (NO auxiliary task)
+    # -------------------------------------------------------------------------
+    print(f"\n[Seed {seed}] Training Large+embed(aux) (no aux training)...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    large_embed_aux = create_large_model()
+
+    # Reload small+aux weights
+    small_aux_fresh = create_small_model()
+    small_aux_fresh.load_state_dict(
+        torch.load(f'{checkpoint_dir}/small_aux_s{seed}_best.pt', weights_only=True)
+    )
+
+    # Embed
+    embed_small_into_large(small_aux_fresh, large_embed_aux)
+
+    # Verify
+    verify_result = verify_embedding(small_aux_fresh, large_embed_aux, tokens)
+    max_diff = max(verify_result['value_diff'], verify_result['policy_diff'], verify_result['sector_diff'])
+    print(f"  Embedding verified: max diff = {max_diff:.2e}")
+
+    model_name = f'large_embed_aux_s{seed}'
+    hist = train_with_probes(
+        large_embed_aux, train_loader, val_loader, n_epochs,
+        model_name=model_name, use_auxiliary=False, device=device,
+        probe_interval=probe_interval, checkpoint_dir=checkpoint_dir,
+        all_histories=all_histories, plots_dir=plots_dir
+    )
+    seed_histories['Large+embed(aux)'] = hist
+    all_histories[f'Large+embed(aux)_s{seed}'] = hist
 
     return seed_histories
 
@@ -819,12 +831,22 @@ def run_full_experiment(phase0_path='data/phase0_games.npz',
     # DataLoader settings:
     # - num_workers=0 since EfficientDataset does minimal work per __getitem__
     #   and we want to avoid duplicating precomputed data across worker processes
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False,  # Already shuffled internally
-                              num_workers=0, collate_fn=collate_batch,
-                              pin_memory=(device == 'cuda'))
+    # - Separate loaders for small models (larger batch) and large models
+    pin = (device == 'cuda')
+
+    # Large model loaders (standard batch size)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, collate_fn=collate_batch, pin_memory=pin)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=0, collate_fn=collate_batch,
-                            pin_memory=(device == 'cuda'))
+                            num_workers=0, collate_fn=collate_batch, pin_memory=pin)
+
+    # Small model loaders (larger batch for faster training)
+    train_loader_small = DataLoader(train_dataset, batch_size=SMALL_BATCH_SIZE, shuffle=False,
+                                    num_workers=0, collate_fn=collate_batch, pin_memory=pin)
+    val_loader_small = DataLoader(val_dataset, batch_size=SMALL_BATCH_SIZE, shuffle=False,
+                                  num_workers=0, collate_fn=collate_batch, pin_memory=pin)
+
+    print(f"  Batch sizes: small={SMALL_BATCH_SIZE}, large={BATCH_SIZE}")
 
     print(f"  Train: {len(train_dataset)} positions, Val: {len(val_dataset)} positions")
 
@@ -844,6 +866,8 @@ def run_full_experiment(phase0_path='data/phase0_games.npz',
             seed=seed,
             train_loader=train_loader,
             val_loader=val_loader,
+            train_loader_small=train_loader_small,
+            val_loader_small=val_loader_small,
             n_epochs=n_epochs,
             device=device,
             probe_interval=probe_interval,

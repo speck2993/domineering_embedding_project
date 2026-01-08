@@ -36,6 +36,7 @@ N_SECTORS = 16      # auxiliary task outputs
 LR = 2e-4
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 200
+SMALL_BATCH_SIZE = 500  # Larger batch for small models (faster training)
 
 # Loss weights
 # Value loss (BCE) is ~0.5-0.7, policy loss (CE over 480 classes) is ~3-4

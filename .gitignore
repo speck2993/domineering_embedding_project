@@ -7,6 +7,14 @@ checkpoints/
 *.pt
 *.pth
 
+# Experiment outputs
+plots/
+results/
+
+# Test and dry run outputs
+test_artifacts/
+dry_run_output/
+
 # Python
 __pycache__/
 *.py[cod]
