@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from config import BATCH_SIZE, SMALL_CONFIG, LARGE_CONFIG
 from model import create_small_model, create_large_model, count_parameters
-from data_loader import DomineeringDataset
+from data_loader import EfficientDomineeringDataset
 from training import train_model, collate_batch, evaluate, compute_losses
 from embedding import embed_small_into_large, verify_embedding
 from probing import train_probes_all_layers, print_probe_summary
@@ -174,6 +174,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
     Returns:
         Dict with training history and probe results
     """
+    # Small models exist only to be embedded - skip expensive step-level tracking
+    is_large_model = 'large' in model_name.lower()
     from config import LR, WEIGHT_DECAY
 
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -209,6 +211,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
     print(f"  Parameters: {count_parameters(model):,}")
     print(f"  Epochs: {n_epochs}, Steps/epoch: {len(train_loader)}, Total: {total_steps}")
     print(f"  Auxiliary task: {use_auxiliary}")
+    if not is_large_model:
+        print(f"  (Skipping step-level validation and probing for small model)")
 
     for epoch in range(n_epochs):
         model.train()
@@ -217,8 +221,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", ncols=100, mininterval=1.0)
         for batch in pbar:
-            # Move to device
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            # Move to device with non_blocking for better GPU utilization
+            batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
 
             # Forward pass
             optimizer.zero_grad()
@@ -248,19 +252,19 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                 avg_loss = sum(recent_losses[-train_log_interval:]) / len(recent_losses[-train_log_interval:])
                 history['step_train_loss'].append((global_step, avg_loss))
 
-            # Quick validation every quick_val_interval steps
-            if global_step % quick_val_interval == 0:
+            # Quick validation every quick_val_interval steps (only for large models)
+            if is_large_model and global_step % quick_val_interval == 0:
                 quick_loss = quick_validate(model, val_loader, device,
                                            use_auxiliary=use_auxiliary, step=global_step)
                 history['step_val_loss'].append((global_step, quick_loss))
                 model.train()
 
-                # Update plots incrementally (only for large models since plots only track those)
-                if all_histories is not None and 'large' in model_name:
+                # Update plots incrementally
+                if all_histories is not None:
                     update_plots_incrementally(all_histories, plots_dir)
 
-            # Probe evaluation every probe_interval steps
-            if global_step % probe_interval == 0:
+            # Probe evaluation every probe_interval steps (only for large models)
+            if is_large_model and global_step % probe_interval == 0:
                 model.eval()
                 probes = train_probes_all_layers(model, val_loader, n_samples=1000,
                                                  device=device)
@@ -269,8 +273,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                     history['probe_r2'][layer_idx].append(probe.val_r2)
                 model.train()
 
-                # Update probe plots (only for large models)
-                if all_histories is not None and 'large' in model_name:
+                # Update probe plots
+                if all_histories is not None:
                     update_probe_plot_incrementally(all_histories, plots_dir)
 
         pbar.close()
@@ -295,10 +299,16 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
             best_val_loss = val_metrics['loss']
             torch.save(model.state_dict(), f"{checkpoint_dir}/{model_name}_best.pt")
 
-    # Final probe evaluation
-    model.eval()
-    probes = train_probes_all_layers(model, val_loader, n_samples=2000, device=device)
-    history['final_probes'] = probes
+        # Signal epoch end to dataset (for EfficientDomineeringDataset to refresh positions)
+        if hasattr(train_loader.dataset, 'on_epoch_end'):
+            train_loader.dataset.on_epoch_end()
+            train_loader.dataset.precompute_epoch()
+
+    # Final probe evaluation (only for large models)
+    if is_large_model:
+        model.eval()
+        probes = train_probes_all_layers(model, val_loader, n_samples=2000, device=device)
+        history['final_probes'] = probes
 
     # Save final checkpoint
     torch.save(model.state_dict(), f"{checkpoint_dir}/{model_name}_final.pt")
@@ -796,15 +806,24 @@ def run_full_experiment(phase0_path='data/phase0_games.npz',
     merge_npz_files(data_files, combined_path)
 
     # Create data loaders
-    train_dataset = DomineeringDataset(combined_path, split='train', positions_per_game=60)
-    val_dataset = DomineeringDataset(combined_path, split='val', positions_per_game=20)
+    # Use EfficientDomineeringDataset for both (precomputes positions)
+    train_dataset = EfficientDomineeringDataset(combined_path, split='train', positions_per_game=60)
+    val_dataset = EfficientDomineeringDataset(combined_path, split='val', positions_per_game=20)
 
-    n_workers = 4 if device == 'cuda' else 2
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=n_workers, collate_fn=collate_batch,
+    # Precompute positions now (before creating DataLoader)
+    print("  Pre-computing training positions...")
+    train_dataset.precompute_epoch()
+    print("  Pre-computing validation positions...")
+    val_dataset.precompute_epoch()
+
+    # DataLoader settings:
+    # - num_workers=0 since EfficientDataset does minimal work per __getitem__
+    #   and we want to avoid duplicating precomputed data across worker processes
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False,  # Already shuffled internally
+                              num_workers=0, collate_fn=collate_batch,
                               pin_memory=(device == 'cuda'))
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=n_workers, collate_fn=collate_batch,
+                            num_workers=0, collate_fn=collate_batch,
                             pin_memory=(device == 'cuda'))
 
     print(f"  Train: {len(train_dataset)} positions, Val: {len(val_dataset)} positions")

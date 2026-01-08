@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from config import BATCH_SIZE
 from model import create_medium_model, count_parameters
-from data_loader import DomineeringDataset
+from data_loader import EfficientDomineeringDataset
 from training import train_model, train_for_steps, evaluate, collate_batch
 from selfplay import compare_models
 
@@ -130,28 +130,35 @@ def run_experiment(phase0_path, selfplay_path, n_epochs=3, n_openings=200,
     print("\n[2/5] Creating data loaders...")
 
     # Phase0 loaders
-    train_dataset_a = DomineeringDataset(phase0_path, split='train')
-    val_dataset_a = DomineeringDataset(phase0_path, split='val')
+    train_dataset_a = EfficientDomineeringDataset(phase0_path, split='train')
+    val_dataset_a = EfficientDomineeringDataset(phase0_path, split='val')
 
     # Combined loaders
-    train_dataset_c = DomineeringDataset(combined_path, split='train')
-    val_dataset_c = DomineeringDataset(combined_path, split='val')
+    train_dataset_c = EfficientDomineeringDataset(combined_path, split='train')
+    val_dataset_c = EfficientDomineeringDataset(combined_path, split='val')
 
-    n_workers = 4 if device == 'cuda' else 2
+    # Precompute positions
+    print("  Pre-computing positions for all datasets...")
+    train_dataset_a.precompute_epoch()
+    val_dataset_a.precompute_epoch()
+    train_dataset_c.precompute_epoch()
+    val_dataset_c.precompute_epoch()
+
     pin_memory = device == 'cuda'
 
-    train_loader_a = DataLoader(train_dataset_a, batch_size=BATCH_SIZE, shuffle=True,
-                                num_workers=n_workers, collate_fn=collate_batch,
+    # EfficientDomineeringDataset handles shuffling internally, so use num_workers=0
+    train_loader_a = DataLoader(train_dataset_a, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=0, collate_fn=collate_batch,
                                 pin_memory=pin_memory)
     val_loader_a = DataLoader(val_dataset_a, batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=n_workers, collate_fn=collate_batch,
+                              num_workers=0, collate_fn=collate_batch,
                               pin_memory=pin_memory)
 
-    train_loader_c = DataLoader(train_dataset_c, batch_size=BATCH_SIZE, shuffle=True,
-                                num_workers=n_workers, collate_fn=collate_batch,
+    train_loader_c = DataLoader(train_dataset_c, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=0, collate_fn=collate_batch,
                                 pin_memory=pin_memory)
     val_loader_c = DataLoader(val_dataset_c, batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=n_workers, collate_fn=collate_batch,
+                              num_workers=0, collate_fn=collate_batch,
                               pin_memory=pin_memory)
 
     # Calculate steps for Model A (3 epochs on phase0)

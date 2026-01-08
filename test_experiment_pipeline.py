@@ -180,7 +180,7 @@ def test_model_creation():
 
 def test_data_loader():
     """Test data loading and dataset creation."""
-    from data_loader import DomineeringDataset, load_games, split_games
+    from data_loader import EfficientDomineeringDataset, load_games, split_games
 
     # Create test data
     test_path = os.path.join(TEST_DATA_DIR, 'test_games.npz')
@@ -195,7 +195,8 @@ def test_data_loader():
     assert 'train' in splits and 'val' in splits and 'test' in splits
 
     # Test dataset
-    dataset = DomineeringDataset(test_path, split='train', positions_per_game=5)
+    dataset = EfficientDomineeringDataset(test_path, split='train', positions_per_game=5)
+    dataset.precompute_epoch()
     assert len(dataset) > 0, "Dataset should have items"
 
     # Test __getitem__
@@ -213,15 +214,16 @@ def test_data_loader():
 
 def test_collate_batch():
     """Test batch collation."""
-    from data_loader import DomineeringDataset
+    from data_loader import EfficientDomineeringDataset
     from training import collate_batch
     from torch.utils.data import DataLoader
 
     test_path = os.path.join(TEST_DATA_DIR, 'test_games.npz')
     create_synthetic_games(50, output_path=test_path)
 
-    dataset = DomineeringDataset(test_path, split='train', positions_per_game=5)
-    loader = DataLoader(dataset, batch_size=4, collate_fn=collate_batch)
+    dataset = EfficientDomineeringDataset(test_path, split='train', positions_per_game=5)
+    dataset.precompute_epoch()
+    loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collate_batch)
 
     batch = next(iter(loader))
     assert 'tokens' in batch, "Batch should have tokens"
@@ -262,7 +264,7 @@ def test_quick_validate():
     """Test quick validation function."""
     from run_experiment import quick_validate
     from model import create_small_model
-    from data_loader import DomineeringDataset
+    from data_loader import EfficientDomineeringDataset
     from training import collate_batch
     from torch.utils.data import DataLoader
 
@@ -270,8 +272,9 @@ def test_quick_validate():
     create_synthetic_games(50, output_path=test_path)
 
     model = create_small_model()
-    dataset = DomineeringDataset(test_path, split='val', positions_per_game=5)
-    loader = DataLoader(dataset, batch_size=10, collate_fn=collate_batch)
+    dataset = EfficientDomineeringDataset(test_path, split='val', positions_per_game=5)
+    dataset.precompute_epoch()
+    loader = DataLoader(dataset, batch_size=10, shuffle=False, collate_fn=collate_batch)
 
     loss = quick_validate(model, loader, device='cpu', use_auxiliary=False, n_batches=2)
     assert loss > 0, f"Loss should be positive, got {loss}"
@@ -303,7 +306,7 @@ def test_probing():
     """Test probing mechanism."""
     from probing import train_probes_all_layers, LinearProbe
     from model import create_small_model
-    from data_loader import DomineeringDataset
+    from data_loader import EfficientDomineeringDataset
     from training import collate_batch
     from torch.utils.data import DataLoader
 
@@ -311,8 +314,9 @@ def test_probing():
     create_synthetic_games(100, output_path=test_path)
 
     model = create_small_model()
-    dataset = DomineeringDataset(test_path, split='val', positions_per_game=10)
-    loader = DataLoader(dataset, batch_size=20, collate_fn=collate_batch)
+    dataset = EfficientDomineeringDataset(test_path, split='val', positions_per_game=10)
+    dataset.precompute_epoch()
+    loader = DataLoader(dataset, batch_size=20, shuffle=False, collate_fn=collate_batch)
 
     probes = train_probes_all_layers(model, loader, n_samples=50, device='cpu')
 
@@ -424,7 +428,7 @@ def test_integration_mini_experiment():
     print("="*60)
 
     from model import create_small_model, create_large_model, count_parameters
-    from data_loader import DomineeringDataset
+    from data_loader import EfficientDomineeringDataset
     from training import collate_batch
     from embedding import embed_small_into_large, verify_embedding
     from run_experiment import (
@@ -442,10 +446,14 @@ def test_integration_mini_experiment():
     test_data_path = os.path.join(TEST_DATA_DIR, 'integration_games.npz')
     create_synthetic_games(100, output_path=test_data_path)
 
-    train_dataset = DomineeringDataset(test_data_path, split='train', positions_per_game=10)
-    val_dataset = DomineeringDataset(test_data_path, split='val', positions_per_game=5)
+    train_dataset = EfficientDomineeringDataset(test_data_path, split='train', positions_per_game=10)
+    val_dataset = EfficientDomineeringDataset(test_data_path, split='val', positions_per_game=5)
 
-    train_loader = DataLoader(train_dataset, batch_size=20, shuffle=True, collate_fn=collate_batch)
+    # Precompute positions
+    train_dataset.precompute_epoch()
+    val_dataset.precompute_epoch()
+
+    train_loader = DataLoader(train_dataset, batch_size=20, shuffle=False, collate_fn=collate_batch)
     val_loader = DataLoader(val_dataset, batch_size=20, shuffle=False, collate_fn=collate_batch)
 
     all_histories = {}

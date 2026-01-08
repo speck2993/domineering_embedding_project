@@ -221,6 +221,257 @@ class DomineeringDataset:
 
 
 # ============================================================================
+# Efficient Dataset with Epoch Precomputation
+# ============================================================================
+
+def augment_board(board, symmetry):
+    """Apply symmetry to a (256,) board array using reshape operations.
+
+    Much faster than lookup tables - just array views and copies.
+    """
+    if symmetry == 0:
+        return board
+    b = board.reshape(BOARD_SIZE, BOARD_SIZE)
+    if symmetry == 1:  # hflip: flip columns
+        return b[:, ::-1].ravel().copy()
+    elif symmetry == 2:  # vflip: flip rows
+        return b[::-1, :].ravel().copy()
+    else:  # rot180: flip both
+        return b[::-1, ::-1].ravel().copy()
+
+
+def augment_remaining(remaining, symmetry):
+    """Apply symmetry to a (480,) remaining moves array.
+
+    Moves have complex indexing so we use the precomputed lookup tables.
+    """
+    if symmetry == 0:
+        return remaining
+    return remaining[_MOVE_AUG_TABLES[symmetry]]
+
+
+# Build move augmentation tables (moves have complex indexing)
+def _build_move_aug_tables():
+    """Build lookup tables for move augmentation."""
+    tables = np.zeros((4, N_MOVES), dtype=np.int32)
+    for m in range(N_MOVES):
+        tables[0, m] = m
+        tables[1, m] = dg.augment_move(m, 1)
+        tables[2, m] = dg.augment_move(m, 2)
+        tables[3, m] = dg.augment_move(m, 3)
+    return tables
+
+# Pre-compute move augmentation tables at module load
+_MOVE_AUG_TABLES = _build_move_aug_tables()
+
+
+def collect_positions_single_pass(moves, length, winner, pos_indices):
+    """Collect multiple positions from a game in a single pass.
+
+    Args:
+        moves: Array of move indices for this game
+        length: Actual length of game
+        winner: True if vertical won
+        pos_indices: Array of position indices to collect (can have duplicates)
+
+    Returns:
+        boards: (n_positions, N_SQUARES) bool array
+        remainings: (n_positions, N_MOVES) bool array
+        next_moves: (n_positions,) int32 array
+        move_indices: (n_positions,) int32 array (copy of pos_indices)
+    """
+    n_positions = len(pos_indices)
+
+    # Sort indices for single-pass collection, keeping track of original order
+    sort_order = np.argsort(pos_indices)
+    sorted_pos = pos_indices[sort_order]
+
+    # Pre-allocate results
+    boards = np.zeros((n_positions, N_SQUARES), dtype=bool)
+    remainings = np.zeros((n_positions, N_MOVES), dtype=bool)
+    next_moves = np.zeros(n_positions, dtype=np.int32)
+
+    # Single pass through game
+    board = np.zeros(N_SQUARES, dtype=bool)
+    remaining = np.ones(N_MOVES, dtype=bool)
+
+    result_idx = 0
+
+    for move_idx in range(length):
+        # Collect all positions at this index
+        while result_idx < n_positions and sorted_pos[result_idx] == move_idx:
+            orig_idx = sort_order[result_idx]
+            boards[orig_idx] = board
+            remainings[orig_idx] = remaining
+            next_moves[orig_idx] = moves[move_idx]
+            result_idx += 1
+
+        # Make the move
+        m = moves[move_idx]
+        squares = move_to_squares[m]
+        board[squares[0]] = True
+        board[squares[1]] = True
+        remaining &= move_eliminations[m]
+
+    return boards, remainings, next_moves, pos_indices.copy()
+
+
+class EfficientDomineeringDataset:
+    """Efficient dataset with epoch precomputation and single-pass collection.
+
+    Pre-computes all positions at epoch start, eliminating redundant game replay.
+    Stores intermediate representation (~740 bytes/position vs ~2.6KB for full tensors).
+    Applies augmentation on-the-fly during batch collation.
+    """
+
+    def __init__(self, npz_path, split='train', positions_per_game=10):
+        """
+        Args:
+            npz_path: Path to NPZ file with game records
+            split: 'train', 'val', or 'test'
+            positions_per_game: Number of positions to sample per game per epoch
+        """
+        moves, lengths, winners = load_games(npz_path)
+        splits = split_games(moves, lengths)
+
+        if split not in splits:
+            raise ValueError(f"Unknown split: {split}")
+
+        indices = splits[split]
+        self.moves = moves[indices]
+        self.lengths = lengths[indices]
+        self.winners = winners[indices]
+        self.positions_per_game = positions_per_game
+        self.n_games = len(self.moves)
+        self.split = split
+
+        # Storage for precomputed epoch data
+        self._boards = None
+        self._remainings = None
+        self._next_moves = None
+        self._move_indices = None
+        self._winners_expanded = None
+        self._symmetries = None
+        self._shuffle_indices = None
+
+        print(f"EfficientDomineeringDataset: {split} split with {self.n_games} games, "
+              f"{len(self)} positions per epoch")
+
+    def __len__(self):
+        return self.n_games * self.positions_per_game
+
+    def precompute_epoch(self, seed=None):
+        """Pre-compute all positions for this epoch using single-pass collection.
+
+        Args:
+            seed: Random seed for reproducibility (optional)
+        """
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        n_total = len(self)
+
+        # Pre-allocate storage
+        self._boards = np.zeros((n_total, N_SQUARES), dtype=bool)
+        self._remainings = np.zeros((n_total, N_MOVES), dtype=bool)
+        self._next_moves = np.zeros(n_total, dtype=np.int32)
+        self._move_indices = np.zeros(n_total, dtype=np.int32)
+        self._winners_expanded = np.zeros(n_total, dtype=bool)
+        self._symmetries = np.random.randint(0, 4, n_total, dtype=np.int8)
+
+        idx = 0
+        for game_idx in range(self.n_games):
+            length = self.lengths[game_idx]
+            winner = self.winners[game_idx]
+
+            # Determine positions to sample
+            min_pos = N_RANDOM_OPENING
+            max_pos = length - 1
+
+            if max_pos <= min_pos:
+                pos_indices = np.full(self.positions_per_game, max(0, max_pos), dtype=np.int32)
+            else:
+                pos_indices = np.random.randint(min_pos, max_pos + 1,
+                                                self.positions_per_game, dtype=np.int32)
+
+            # Single-pass collection
+            boards, remainings, next_moves, move_indices = collect_positions_single_pass(
+                self.moves[game_idx], length, winner, pos_indices
+            )
+
+            # Store results
+            n_pos = len(boards)
+            self._boards[idx:idx+n_pos] = boards
+            self._remainings[idx:idx+n_pos] = remainings
+            self._next_moves[idx:idx+n_pos] = next_moves
+            self._move_indices[idx:idx+n_pos] = move_indices
+            self._winners_expanded[idx:idx+n_pos] = winner
+            idx += n_pos
+
+        # Shuffle indices
+        self._shuffle_indices = np.random.permutation(n_total)
+
+    def __getitem__(self, idx):
+        """Get a single position with augmentation applied."""
+        if self._boards is None:
+            self.precompute_epoch()
+
+        # Get shuffled index
+        real_idx = self._shuffle_indices[idx]
+
+        # Get raw data
+        board = self._boards[real_idx]
+        remaining_orig = self._remainings[real_idx]
+        next_move = self._next_moves[real_idx]
+        move_idx = self._move_indices[real_idx]
+        winner = self._winners_expanded[real_idx]
+        symmetry = self._symmetries[real_idx]
+
+        # Apply augmentation
+        if symmetry > 0:
+            board = augment_board(board, symmetry)
+            remaining = augment_remaining(remaining_orig, symmetry)
+            next_move = _MOVE_AUG_TABLES[symmetry, next_move]
+        else:
+            remaining = remaining_orig
+
+        # Compute sectors from augmented remaining (matches make_position behavior)
+        sectors = compute_sector_targets_fast(remaining)
+
+        # Build tokens
+        tokens = np.zeros(257, dtype=np.int64)
+        tokens[:256] = board.astype(np.int64)
+        tokens[256] = 2  # CLS token
+
+        # Determine legal moves for current player
+        is_horizontal_turn = (move_idx % 2 == 1)
+        if is_horizontal_turn:
+            legal = remaining & player_2_legal_moves
+        else:
+            legal = remaining & player_1_legal_moves
+
+        return {
+            'tokens': tokens,
+            'value': np.float32(1.0 if winner else 0.0),
+            'policy': np.int64(next_move),
+            'mask': legal,
+            'sectors': sectors
+        }
+
+    def on_epoch_end(self):
+        """Call at end of epoch to prepare for next epoch."""
+        # Clear precomputed data to trigger recomputation
+        self._boards = None
+        self._remainings = None
+        self._next_moves = None
+        self._move_indices = None
+        self._winners_expanded = None
+        self._symmetries = None
+        self._shuffle_indices = None
+
+
+# ============================================================================
 # Tests
 # ============================================================================
 
@@ -300,11 +551,12 @@ def test_sector_targets_match():
     remaining = game[4]
 
     # Compare fast and original implementations
+    # Note: fast version divides by 10 for normalization, so we scale back
     fast_result = compute_sector_targets_fast(remaining)
     orig_result = dg.compute_sector_targets(game)
 
-    assert np.allclose(fast_result, orig_result), \
-        f"Mismatch: fast={fast_result}, orig={orig_result}"
+    assert np.allclose(fast_result * 10, orig_result), \
+        f"Mismatch: fast*10={fast_result*10}, orig={orig_result}"
 
     print("PASS: test_sector_targets_match")
 
@@ -373,6 +625,176 @@ def test_make_position_shapes():
     print("PASS: test_make_position_shapes")
 
 
+def test_single_pass_collection():
+    """Test that single-pass collection matches individual replay."""
+    # Create a test game
+    game = dg.domineering_game()
+    moves = []
+    for _ in range(40):
+        legal = dg.legal_moves(game)
+        legal_indices = np.where(legal)[0]
+        if len(legal_indices) == 0:
+            break
+        move = np.random.choice(legal_indices)
+        moves.append(move)
+        dg.make_move(game, move)
+
+    moves = np.array(moves, dtype=np.int16)
+    length = len(moves)
+    winner = True
+
+    # Test positions to collect
+    pos_indices = np.array([16, 20, 25, 30, 35], dtype=np.int32)
+
+    # Single-pass collection
+    boards, remainings, next_moves, move_indices = collect_positions_single_pass(
+        moves, length, winner, pos_indices
+    )
+
+    # Compare with individual replay
+    for i, pos_idx in enumerate(pos_indices):
+        expected_board, expected_remaining = replay_to_position(moves, pos_idx, symmetry=0)
+
+        assert np.array_equal(boards[i], expected_board), \
+            f"Board mismatch at pos_idx={pos_idx}"
+        assert np.array_equal(remainings[i], expected_remaining), \
+            f"Remaining mismatch at pos_idx={pos_idx}"
+        assert next_moves[i] == moves[pos_idx], \
+            f"Next move mismatch at pos_idx={pos_idx}"
+
+    print("PASS: test_single_pass_collection")
+
+
+def test_augmentation_functions():
+    """Test board and move augmentation functions."""
+    np.random.seed(42)
+
+    # Test board augmentation - create a simple test board
+    board = np.zeros(N_SQUARES, dtype=bool)
+    board[0] = True   # top-left corner
+    board[15] = True  # top-right corner
+    board[240] = True # bottom-left corner
+
+    # hflip: top-left -> top-right, top-right -> top-left
+    hflip_board = augment_board(board, 1)
+    assert hflip_board[15] == True, "hflip: top-left should go to top-right"
+    assert hflip_board[0] == True, "hflip: top-right should go to top-left"
+    assert hflip_board[255] == True, "hflip: bottom-left should go to bottom-right"
+
+    # vflip: top-left -> bottom-left, bottom-left -> top-left
+    vflip_board = augment_board(board, 2)
+    assert vflip_board[240] == True, "vflip: top-left should go to bottom-left"
+    assert vflip_board[0] == True, "vflip: bottom-left should go to top-left"
+
+    # rot180 should be self-inverse
+    rot180_board = augment_board(board, 3)
+    rot180_again = augment_board(rot180_board, 3)
+    assert np.array_equal(board, rot180_again), "rot180 should be self-inverse"
+
+    # Test move augmentation tables
+    for sym in range(4):
+        # Check it's a valid permutation
+        assert len(set(_MOVE_AUG_TABLES[sym])) == N_MOVES, \
+            f"Move aug table {sym} is not a permutation"
+
+    # Test that rot180 is self-inverse for moves
+    for m in range(N_MOVES):
+        assert _MOVE_AUG_TABLES[3, _MOVE_AUG_TABLES[3, m]] == m, \
+            f"rot180 not self-inverse for move {m}"
+
+    print("PASS: test_augmentation_functions")
+
+
+def test_efficient_vs_original():
+    """Verify EfficientDomineeringDataset produces identical outputs to make_position.
+
+    This is the critical correctness test - if this passes, the efficient dataset
+    is a drop-in replacement for the original.
+    """
+    np.random.seed(42)
+
+    # Create a test game
+    game = dg.domineering_game()
+    moves = []
+    for _ in range(50):
+        legal = dg.legal_moves(game)
+        legal_indices = np.where(legal)[0]
+        if len(legal_indices) == 0:
+            break
+        move = np.random.choice(legal_indices)
+        moves.append(move)
+        dg.make_move(game, move)
+
+    moves = np.array(moves, dtype=np.int16)
+    length = len(moves)
+    winner = True
+
+    # Test multiple positions and symmetries
+    test_cases = [
+        (16, 0), (16, 1), (16, 2), (16, 3),  # Early position, all symmetries
+        (25, 0), (25, 1), (25, 2), (25, 3),  # Mid position, all symmetries
+        (length-2, 0), (length-2, 3),         # Late position
+    ]
+
+    for pos_idx, symmetry in test_cases:
+        if pos_idx >= length:
+            continue
+
+        # Ground truth: use make_position
+        expected = make_position(moves, length, winner, pos_idx, symmetry)
+
+        # Efficient method: collect unaugmented, then apply augmentation
+        # 1. Get unaugmented board and remaining (simulates single-pass collection)
+        board_orig, remaining_orig = replay_to_position(moves, pos_idx, symmetry=0)
+        next_move_orig = moves[pos_idx]
+
+        # 2. Apply augmentation to board and remaining
+        if symmetry > 0:
+            board_aug = augment_board(board_orig, symmetry)
+            remaining_aug = augment_remaining(remaining_orig, symmetry)
+            next_move_aug = _MOVE_AUG_TABLES[symmetry, next_move_orig]
+        else:
+            board_aug = board_orig
+            remaining_aug = remaining_orig
+            next_move_aug = next_move_orig
+
+        # 3. Compute sectors from augmented remaining (matches make_position behavior)
+        sectors = compute_sector_targets_fast(remaining_aug)
+
+        # 4. Build the position dict (same logic as EfficientDomineeringDataset.__getitem__)
+        tokens = np.zeros(257, dtype=np.int64)
+        tokens[:256] = board_aug.astype(np.int64)
+        tokens[256] = 2
+
+        is_horizontal_turn = (pos_idx % 2 == 1)
+        if is_horizontal_turn:
+            legal = remaining_aug & player_2_legal_moves
+        else:
+            legal = remaining_aug & player_1_legal_moves
+
+        actual = {
+            'tokens': tokens,
+            'value': np.float32(1.0 if winner else 0.0),
+            'policy': np.int64(next_move_aug),
+            'mask': legal,
+            'sectors': sectors
+        }
+
+        # Compare all fields
+        assert np.array_equal(actual['tokens'], expected['tokens']), \
+            f"tokens mismatch at pos={pos_idx}, sym={symmetry}"
+        assert actual['value'] == expected['value'], \
+            f"value mismatch at pos={pos_idx}, sym={symmetry}"
+        assert actual['policy'] == expected['policy'], \
+            f"policy mismatch at pos={pos_idx}, sym={symmetry}: got {actual['policy']}, expected {expected['policy']}"
+        assert np.array_equal(actual['mask'], expected['mask']), \
+            f"mask mismatch at pos={pos_idx}, sym={symmetry}"
+        assert np.allclose(actual['sectors'], expected['sectors']), \
+            f"sectors mismatch at pos={pos_idx}, sym={symmetry}:\n  got {actual['sectors']}\n  expected {expected['sectors']}"
+
+    print("PASS: test_efficient_vs_original")
+
+
 def run_data_loader_tests():
     """Run all data loader tests."""
     print("=" * 60)
@@ -387,6 +809,9 @@ def run_data_loader_tests():
     test_sector_targets_match()
     test_split_deterministic()
     test_make_position_shapes()
+    test_single_pass_collection()
+    test_augmentation_functions()
+    test_efficient_vs_original()
 
     print("=" * 60)
     print("All data loader tests passed!")

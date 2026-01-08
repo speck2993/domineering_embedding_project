@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import SMALL_CONFIG, LARGE_CONFIG
 from model import create_small_model, create_large_model, count_parameters
-from data_loader import DomineeringDataset
+from data_loader import EfficientDomineeringDataset
 from training import train_for_steps, collate_batch, evaluate, compute_losses
 from embedding import embed_small_into_large, verify_embedding
 from probing import train_probes_all_layers
@@ -120,11 +120,15 @@ def run_dry_run():
         merge_npz_files([game_path], combined_path)
 
         # Test dataset creation
-        train_dataset = DomineeringDataset(combined_path, split='train', positions_per_game=10)
-        val_dataset = DomineeringDataset(combined_path, split='val', positions_per_game=5)
+        train_dataset = EfficientDomineeringDataset(combined_path, split='train', positions_per_game=10)
+        val_dataset = EfficientDomineeringDataset(combined_path, split='val', positions_per_game=5)
+
+        # Precompute epoch positions
+        train_dataset.precompute_epoch()
+        val_dataset.precompute_epoch()
 
         from torch.utils.data import DataLoader
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False,
                                   num_workers=0, collate_fn=collate_batch)
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
                                 num_workers=0, collate_fn=collate_batch)
@@ -200,9 +204,9 @@ def run_dry_run():
         print(f"  Probe evaluations: {len(hist['probe_steps'])}")
         print(f"  Final val loss: {hist['val_loss'][-1]:.4f}")
 
-        # Verify we got multiple probes and validations
-        assert len(hist['step_val_loss']) >= 1, "No validation samples collected"
-        assert len(hist['probe_steps']) >= 1, "No probe evaluations done"
+        # Small models skip step-level validation and probing (only large models matter)
+        # Just verify training loop ran successfully with epoch-level val
+        assert len(hist['val_loss']) >= 1, "No epoch-level validation done"
 
         # Save checkpoint for embedding test
         torch.save(

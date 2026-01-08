@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from config import LR, WEIGHT_DECAY, BATCH_SIZE, POLICY_LOSS_WEIGHT, SECTOR_LOSS_WEIGHT
 from model import create_small_model, create_medium_model, create_large_model, count_parameters
-from data_loader import DomineeringDataset
+from data_loader import EfficientDomineeringDataset
 
 
 # ============================================================================
@@ -33,7 +33,7 @@ def collate_batch(samples):
     """Stack samples into batched tensors.
 
     Args:
-        samples: List of dicts from DomineeringDataset
+        samples: List of dicts from EfficientDomineeringDataset
 
     Returns:
         Dict with batched tensors on CPU (move to device in training loop)
@@ -495,14 +495,22 @@ def main():
 
     # Load datasets
     print(f"Loading data from {args.data}")
-    train_dataset = DomineeringDataset(args.data, split='train')
-    val_dataset = DomineeringDataset(args.data, split='val')
+    train_dataset = EfficientDomineeringDataset(args.data, split='train')
+    val_dataset = EfficientDomineeringDataset(args.data, split='val')
 
+    # Precompute positions
+    print("Pre-computing training positions...")
+    train_dataset.precompute_epoch()
+    print("Pre-computing validation positions...")
+    val_dataset.precompute_epoch()
+
+    # EfficientDomineeringDataset handles shuffling internally, so use num_workers=0
+    # to avoid duplicating precomputed data across worker processes
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=use_workers,
+        shuffle=False,  # Already shuffled internally
+        num_workers=0,
         collate_fn=collate_batch,
         pin_memory=use_pin_memory
     )
@@ -510,7 +518,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=use_workers,
+        num_workers=0,
         collate_fn=collate_batch,
         pin_memory=use_pin_memory
     )

@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 import domineering_game as dg
 from domineering_game import copy_game
 from model import create_small_model, create_medium_model, create_large_model, game_to_tokens, count_parameters
-from data_loader import DomineeringDataset
+from data_loader import EfficientDomineeringDataset
 from training import train_model, collate_batch
 
 
@@ -605,10 +605,14 @@ def iterative_selfplay(initial_model_path, target_games, output_path,
         new_model.load_state_dict(copy.deepcopy(baseline_model.state_dict()))
         new_model.to(device)
 
-        train_dataset = DomineeringDataset(temp_path, split='train')
-        val_dataset = DomineeringDataset(temp_path, split='val')
+        train_dataset = EfficientDomineeringDataset(temp_path, split='train')
+        val_dataset = EfficientDomineeringDataset(temp_path, split='val')
 
-        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True,
+        # Precompute positions
+        train_dataset.precompute_epoch()
+        val_dataset.precompute_epoch()
+
+        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=False,  # Already shuffled internally
                                   num_workers=0, collate_fn=collate_batch)
         val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False,
                                 num_workers=0, collate_fn=collate_batch)
