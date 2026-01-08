@@ -94,7 +94,7 @@ def merge_npz_files(paths, output_path):
 # Quick Validation
 # ============================================================================
 
-def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5):
+def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5, step=None):
     """Fast validation on a small subset (~1000 samples).
 
     Returns unbiased estimate of validation loss.
@@ -106,6 +106,8 @@ def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5):
         device: Device for evaluation
         use_auxiliary: Whether to include sector loss
         n_batches: Number of batches to evaluate (default 5 = ~1000 samples)
+        step: If provided, seeds batch selection so all models at the same step
+              evaluate on the same random batches (for fair comparison)
 
     Returns:
         float: Average loss over sampled batches
@@ -114,10 +116,21 @@ def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5):
     total_loss = 0.0
     n_samples = 0
 
+    # Determine which batches to use
+    total_batches = len(val_loader)
+    if step is not None and total_batches > n_batches:
+        # Seed by step so all models at same step get same batches
+        rng = random.Random(step)
+        batch_indices = set(rng.sample(range(total_batches), n_batches))
+    else:
+        # Just use first n_batches
+        batch_indices = set(range(min(n_batches, total_batches)))
+
+    batches_processed = 0
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
-            if i >= n_batches:
-                break
+            if i not in batch_indices:
+                continue
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             value_pred, policy_logits, sector_pred = model(batch['tokens'], batch['mask'])
             loss, _, _, _ = compute_losses(
@@ -125,6 +138,9 @@ def quick_validate(model, val_loader, device, use_auxiliary=False, n_batches=5):
                 batch, use_auxiliary=use_auxiliary)
             total_loss += loss.item() * len(batch['tokens'])
             n_samples += len(batch['tokens'])
+            batches_processed += 1
+            if batches_processed >= n_batches:
+                break
 
     return total_loss / n_samples if n_samples > 0 else 0.0
 
@@ -234,12 +250,13 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
 
             # Quick validation every quick_val_interval steps
             if global_step % quick_val_interval == 0:
-                quick_loss = quick_validate(model, val_loader, device, use_auxiliary=use_auxiliary)
+                quick_loss = quick_validate(model, val_loader, device,
+                                           use_auxiliary=use_auxiliary, step=global_step)
                 history['step_val_loss'].append((global_step, quick_loss))
                 model.train()
 
-                # Update plots incrementally
-                if all_histories is not None:
+                # Update plots incrementally (only for large models since plots only track those)
+                if all_histories is not None and 'large' in model_name:
                     update_plots_incrementally(all_histories, plots_dir)
 
             # Probe evaluation every probe_interval steps
@@ -252,8 +269,8 @@ def train_with_probes(model, train_loader, val_loader, n_epochs, model_name,
                     history['probe_r2'][layer_idx].append(probe.val_r2)
                 model.train()
 
-                # Update probe plots
-                if all_histories is not None:
+                # Update probe plots (only for large models)
+                if all_histories is not None and 'large' in model_name:
                     update_probe_plot_incrementally(all_histories, plots_dir)
 
         pbar.close()
@@ -328,40 +345,30 @@ def update_plots_incrementally(all_histories, plots_dir='plots'):
             continue
         color = MODEL_COLORS.get(type_name, 'gray')
 
-        # Plot individual models (translucent)
+        # Plot individual models (translucent, no labels)
         for hist in hists:
             if 'step_train_loss' in hist and hist['step_train_loss']:
                 steps, losses = zip(*hist['step_train_loss'])
-                ax.plot(steps, losses, color=color, alpha=0.3, linewidth=1)
+                ax.plot(steps, losses, color=color, alpha=0.25, linewidth=1)
 
-        # Plot average (opaque) if we have multiple models
-        if len(hists) > 1:
-            # Find common steps across all models
-            all_steps = set()
-            for hist in hists:
-                if 'step_train_loss' in hist:
-                    all_steps.update(s for s, _ in hist['step_train_loss'])
-            all_steps = sorted(all_steps)
-
-            if all_steps:
-                avg_losses = []
-                for step in all_steps:
-                    losses_at_step = []
-                    for hist in hists:
-                        step_dict = dict(hist.get('step_train_loss', []))
-                        if step in step_dict:
-                            losses_at_step.append(step_dict[step])
-                    if losses_at_step:
-                        avg_losses.append(np.mean(losses_at_step))
-                    else:
-                        avg_losses.append(np.nan)
-
-                ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
+        # Plot running average (opaque, with label) if we have data
+        all_data = []
+        for hist in hists:
+            if 'step_train_loss' in hist and hist['step_train_loss']:
+                all_data.append(dict(hist['step_train_loss']))
+        if all_data:
+            all_steps = sorted(set().union(*[d.keys() for d in all_data]))
+            avg_losses = []
+            for step in all_steps:
+                vals = [d[step] for d in all_data if step in d]
+                avg_losses.append(np.mean(vals) if vals else np.nan)
+            ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
 
     ax.set_xlabel('Training Step')
     ax.set_ylabel('Training Loss')
     ax.set_title('Training Loss')
-    ax.legend()
+    if ax.get_legend_handles_labels()[0]:  # Only add legend if there are labeled artists
+        ax.legend()
     ax.grid(True, alpha=0.3)
 
     # Plot validation loss (right subplot)
@@ -371,39 +378,30 @@ def update_plots_incrementally(all_histories, plots_dir='plots'):
             continue
         color = MODEL_COLORS.get(type_name, 'gray')
 
-        # Plot individual models (translucent)
+        # Plot individual models (translucent, no labels)
         for hist in hists:
             if 'step_val_loss' in hist and hist['step_val_loss']:
                 steps, losses = zip(*hist['step_val_loss'])
-                ax.plot(steps, losses, color=color, alpha=0.3, linewidth=1)
+                ax.plot(steps, losses, color=color, alpha=0.25, linewidth=1)
 
-        # Plot average (opaque) if we have multiple models
-        if len(hists) > 1:
-            all_steps = set()
-            for hist in hists:
-                if 'step_val_loss' in hist:
-                    all_steps.update(s for s, _ in hist['step_val_loss'])
-            all_steps = sorted(all_steps)
-
-            if all_steps:
-                avg_losses = []
-                for step in all_steps:
-                    losses_at_step = []
-                    for hist in hists:
-                        step_dict = dict(hist.get('step_val_loss', []))
-                        if step in step_dict:
-                            losses_at_step.append(step_dict[step])
-                    if losses_at_step:
-                        avg_losses.append(np.mean(losses_at_step))
-                    else:
-                        avg_losses.append(np.nan)
-
-                ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
+        # Plot running average (opaque, with label) if we have data
+        all_data = []
+        for hist in hists:
+            if 'step_val_loss' in hist and hist['step_val_loss']:
+                all_data.append(dict(hist['step_val_loss']))
+        if all_data:
+            all_steps = sorted(set().union(*[d.keys() for d in all_data]))
+            avg_losses = []
+            for step in all_steps:
+                vals = [d[step] for d in all_data if step in d]
+                avg_losses.append(np.mean(vals) if vals else np.nan)
+            ax.plot(all_steps, avg_losses, color=color, alpha=1.0, linewidth=2, label=type_name)
 
     ax.set_xlabel('Training Step')
     ax.set_ylabel('Validation Loss')
     ax.set_title('Validation Loss (Quick Samples)')
-    ax.legend()
+    if ax.get_legend_handles_labels()[0]:  # Only add legend if there are labeled artists
+        ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -442,44 +440,35 @@ def update_probe_plot_incrementally(all_histories, plots_dir='plots'):
             continue
         color = MODEL_COLORS.get(type_name, 'gray')
 
-        # Plot individual models (translucent)
+        # Plot individual models (translucent, no labels)
         for hist in hists:
             probe_steps = hist.get('probe_steps', [])
             probe_r2 = hist.get('probe_r2', {})
             if target_layer in probe_r2 and probe_steps:
                 ax.plot(probe_steps, probe_r2[target_layer],
-                       color=color, alpha=0.3, linewidth=1, marker='o', markersize=2)
+                       color=color, alpha=0.25, linewidth=1, marker='o', markersize=2)
 
-        # Plot average (opaque) if we have multiple models
-        if len(hists) > 1:
-            all_steps = set()
-            for hist in hists:
-                all_steps.update(hist.get('probe_steps', []))
-            all_steps = sorted(all_steps)
-
-            if all_steps:
-                avg_r2 = []
-                for step in all_steps:
-                    r2_at_step = []
-                    for hist in hists:
-                        probe_steps = hist.get('probe_steps', [])
-                        probe_r2 = hist.get('probe_r2', {})
-                        if step in probe_steps and target_layer in probe_r2:
-                            idx = probe_steps.index(step)
-                            if idx < len(probe_r2[target_layer]):
-                                r2_at_step.append(probe_r2[target_layer][idx])
-                    if r2_at_step:
-                        avg_r2.append(np.mean(r2_at_step))
-                    else:
-                        avg_r2.append(np.nan)
-
-                ax.plot(all_steps, avg_r2, color=color, alpha=1.0, linewidth=2,
-                       label=type_name, marker='o', markersize=3)
+        # Plot running average (opaque, with label) if we have data
+        all_data = []
+        for hist in hists:
+            probe_steps = hist.get('probe_steps', [])
+            probe_r2 = hist.get('probe_r2', {})
+            if target_layer in probe_r2 and probe_steps:
+                all_data.append(dict(zip(probe_steps, probe_r2[target_layer])))
+        if all_data:
+            all_steps = sorted(set().union(*[d.keys() for d in all_data]))
+            avg_r2 = []
+            for step in all_steps:
+                vals = [d[step] for d in all_data if step in d]
+                avg_r2.append(np.mean(vals) if vals else np.nan)
+            ax.plot(all_steps, avg_r2, color=color, alpha=1.0, linewidth=2,
+                   marker='o', markersize=4, label=type_name)
 
     ax.set_xlabel('Training Step')
     ax.set_ylabel('Probe R²')
     ax.set_title(f'Probe R² at Layer {target_layer} (Last Embedded Layer)')
-    ax.legend()
+    if ax.get_legend_handles_labels()[0]:  # Only add legend if there are labeled artists
+        ax.legend()
     ax.grid(True, alpha=0.3)
     ax.set_ylim(0, 1)
 
