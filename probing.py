@@ -23,7 +23,6 @@ def get_layer_activations(model, tokens: torch.Tensor, layer_idx: int) -> torch.
         model: DomineeringTransformer model
         tokens: (batch, 257) token tensor
         layer_idx: Which layer to extract from (0 to n_layers-1)
-                   Use -1 for after final_ln (pre-output)
 
     Returns:
         (batch, d_model) tensor of CLS token activations
@@ -34,18 +33,11 @@ def get_layer_activations(model, tokens: torch.Tensor, layer_idx: int) -> torch.
         # Embed tokens
         x = model.state_embed(tokens) + model.pos_embed(model.positions)
 
-        # Run through layers up to layer_idx
-        if layer_idx == -1:
-            # Run all layers + final LN
-            for layer in model.layers:
-                x = layer(x)
-            x = model.final_ln(x)
-        else:
-            # Run up to and including layer_idx
-            for i, layer in enumerate(model.layers):
-                x = layer(x)
-                if i == layer_idx:
-                    break
+        # Run up to and including layer_idx
+        for i, layer in enumerate(model.layers):
+            x = layer(x)
+            if i == layer_idx:
+                break
 
         # Extract CLS token (last position)
         cls = x[:, -1]  # (batch, d_model)
@@ -64,7 +56,6 @@ def get_all_layer_activations(model, tokens: torch.Tensor) -> Dict[int, torch.Te
 
     Returns:
         Dict mapping layer_idx -> (batch, d_model) activations
-        Includes -1 for post-final-LN activations
     """
     model.eval()
     activations = {}
@@ -75,9 +66,6 @@ def get_all_layer_activations(model, tokens: torch.Tensor) -> Dict[int, torch.Te
         for i, layer in enumerate(model.layers):
             x = layer(x)
             activations[i] = x[:, -1].clone()  # CLS token
-
-        x = model.final_ln(x)
-        activations[-1] = x[:, -1].clone()
 
     return activations
 
@@ -137,14 +125,12 @@ def train_probes_all_layers(model, dataloader, n_samples: int = 2000,
 
     Returns:
         Dict mapping layer_idx -> fitted LinearProbe
-        Includes -1 for post-final-LN layer
     """
     model.eval()
     model.to(device)
 
     # Collect activations and targets
     all_activations = {i: [] for i in range(model.n_layers)}
-    all_activations[-1] = []
     all_sectors = []
 
     samples_collected = 0
@@ -203,11 +189,7 @@ def evaluate_probes(probes: Dict[int, LinearProbe]) -> Dict[str, float]:
     """
     results = {}
     for layer_idx, probe in sorted(probes.items()):
-        if layer_idx == -1:
-            prefix = 'final'
-        else:
-            prefix = f'layer_{layer_idx}'
-
+        prefix = f'layer_{layer_idx}'
         results[f'{prefix}_train_r2'] = probe.train_r2
         results[f'{prefix}_val_r2'] = probe.val_r2
 
@@ -219,10 +201,7 @@ def print_probe_summary(probes: Dict[int, LinearProbe], model_name: str = "Model
     print(f"\n{model_name} Probe R² (validation):")
     print("-" * 30)
     for layer_idx in sorted(probes.keys()):
-        if layer_idx == -1:
-            name = "Final LN"
-        else:
-            name = f"Layer {layer_idx}"
+        name = f"Layer {layer_idx}"
         probe = probes[layer_idx]
         print(f"  {name:10}: {probe.val_r2:.4f}")
 
@@ -246,10 +225,6 @@ def test_get_layer_activations():
         acts = get_layer_activations(model, tokens, layer_idx)
         assert acts.shape == (batch_size, model.d_model), f"Layer {layer_idx} shape mismatch"
 
-    # Test final LN
-    acts = get_layer_activations(model, tokens, -1)
-    assert acts.shape == (batch_size, model.d_model), "Final LN shape mismatch"
-
     print("PASS: test_get_layer_activations")
 
 
@@ -265,9 +240,8 @@ def test_get_all_layer_activations():
 
     all_acts = get_all_layer_activations(model, tokens)
 
-    # Should have n_layers + 1 entries (layers 0,1 and final)
-    assert len(all_acts) == model.n_layers + 1
-    assert -1 in all_acts
+    # Should have n_layers entries (layers 0 to n_layers-1)
+    assert len(all_acts) == model.n_layers
 
     for layer_idx, acts in all_acts.items():
         assert acts.shape == (batch_size, model.d_model)

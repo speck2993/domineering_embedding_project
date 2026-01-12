@@ -5,7 +5,7 @@ persists to convergence by fitting asymptotic curves and bootstrapping
 confidence intervals.
 
 Usage:
-    python analyze_asymptotic_gap.py [--bootstrap N] [--layer LAYER]
+    python analyze_experiment.py [--bootstrap N] [--layer LAYER]
 
 The script reads from results/histories.json and saves plots to plots/.
 
@@ -15,6 +15,7 @@ Use --layer -1 for post-final-LN layer if desired.
 
 import json
 import argparse
+import time
 import numpy as np
 from scipy.optimize import curve_fit, minimize
 import matplotlib.pyplot as plt
@@ -177,7 +178,7 @@ def fit_double_exp(steps, gap, n_restarts=10):
 
                 try:
                     popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds,
-                                       maxfev=5000)
+                                       maxfev=1000)
                     pred = model(steps, *popt)
                     rmse = np.sqrt(np.mean((gap - pred)**2))
 
@@ -233,7 +234,7 @@ def fit_single_exp(steps, gap):
     bounds = ([-0.5, 0.001, 100], [0.5, 1.0, steps[-1] * 3])
 
     try:
-        popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=5000)
+        popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=1000)
         gap_inf, A, tau = popt
         pred = model(steps, *popt)
         rmse = np.sqrt(np.mean((gap - pred)**2))
@@ -278,7 +279,7 @@ def fit_power_law(steps, gap):
     bounds = ([-0.5, 0.01, 0.1, 100], [0.5, 100, 2.0, steps[-1]])
 
     try:
-        popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=5000)
+        popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=1000)
         gap_inf, A, alpha, t0 = popt
         pred = model(steps, *popt)
         rmse = np.sqrt(np.mean((gap - pred)**2))
@@ -344,7 +345,7 @@ def fit_double_power_law(steps, gap, n_restarts=10):
                 )
 
                 try:
-                    popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=5000)
+                    popt, _ = curve_fit(model, steps, gap, p0=p0, bounds=bounds, maxfev=1000)
 
                     # Enforce alpha1 < alpha2 constraint
                     if popt[3] >= popt[4]:
@@ -395,7 +396,6 @@ def fit_all_models(steps, gap):
         'Double exponential': fit_double_exp,
         'Single exponential': fit_single_exp,
         'Power law': fit_power_law,
-        'Double power law': fit_double_power_law,
     }
 
     results = {}
@@ -427,15 +427,15 @@ def select_best_model(steps, gap):
 # Bootstrap
 # =============================================================================
 
-def bootstrap_gap_inf(steps, gaps_all_runs, n_bootstrap=5000, verbose=True):
-    """Bootstrap confidence interval for asymptotic gap.
+def bootstrap_gap_inf(steps, gaps_all_runs, n_bootstrap=1000, verbose=True):
+    """Bootstrap confidence interval for asymptotic gap using single exponential.
 
     Procedure:
-    1. Fit all models to mean trajectory, select best by BIC
+    1. Fit single exponential to mean trajectory for point estimate
     2. For each bootstrap iteration:
        - For each probe step, randomly choose one of the runs
        - Build virtual trajectory from these choices
-       - Fit the SAME model (chosen in step 1), extract gap_inf
+       - Fit single exponential, extract gap_inf
     3. Compute CI from distribution of gap_inf values
 
     Args:
@@ -445,83 +445,177 @@ def bootstrap_gap_inf(steps, gaps_all_runs, n_bootstrap=5000, verbose=True):
         verbose: print progress
 
     Returns:
-        dict with gap_inf, ci_95, bootstrap_samples, best_model, etc.
+        dict with gap_inf, ci_95, bootstrap_samples, etc.
     """
     steps = np.array(steps, dtype=float)
     gaps_all_runs = np.array(gaps_all_runs)
     n_runs, n_steps = gaps_all_runs.shape
 
-    # Step 1: Fit all models to mean trajectory, select best by BIC
+    # Step 1: Fit single exponential to mean trajectory
     mean_gap = np.mean(gaps_all_runs, axis=0)
-    point_fit = select_best_model(steps, mean_gap)
+    point_fit = fit_single_exp(steps, mean_gap)
 
-    if point_fit is None:
-        print("Warning: Could not fit any model to mean trajectory")
+    if not point_fit['success']:
+        print("Warning: Could not fit single exponential to mean trajectory")
         return {'success': False}
 
-    chosen_model = point_fit['name']
     if verbose:
-        print(f"  Selected model: {chosen_model} (BIC: {point_fit['bic']:.1f})")
+        print(f"  Single exponential fit: gap_inf={point_fit['gap_inf']:.4f}, RMSE={point_fit['rmse']:.5f}")
 
-    # Get the fitting function for the chosen model
-    fit_func_map = {
-        'Double exponential': fit_double_exp,
-        'Single exponential': fit_single_exp,
-        'Power law': fit_power_law,
-        'Double power law': fit_double_power_law,
-    }
-    fit_func = fit_func_map[chosen_model]
-
-    # Step 2: Bootstrap using the chosen model
-    bootstrap_gap_inf = []
+    # Step 2: Bootstrap using single exponential
+    bootstrap_samples = []
     n_failures = 0
+    start_time = time.time()
+
+    # Calculate progress report interval (every 10% or at least every 100 iterations)
+    report_interval = max(100, n_bootstrap // 10)
 
     if verbose:
         print(f"  Running {n_bootstrap} bootstrap iterations...")
 
     for b in range(n_bootstrap):
-        if verbose and (b + 1) % 1000 == 0:
-            print(f"    {b + 1}/{n_bootstrap}")
+        if verbose and (b + 1) % report_interval == 0:
+            elapsed = time.time() - start_time
+            rate = (b + 1) / elapsed
+            eta = (n_bootstrap - b - 1) / rate
+            print(f"    {b + 1}/{n_bootstrap} ({elapsed:.1f}s elapsed, {eta:.1f}s remaining)")
 
         # For each step, randomly choose one run
         run_choices = np.random.randint(0, n_runs, size=n_steps)
         virtual_gap = gaps_all_runs[run_choices, np.arange(n_steps)]
 
-        # Fit the SAME model we chose earlier
-        result = fit_func(steps, virtual_gap)
+        # Fit single exponential
+        result = fit_single_exp(steps, virtual_gap)
 
         if result['success']:
-            bootstrap_gap_inf.append(result['gap_inf'])
+            bootstrap_samples.append(result['gap_inf'])
         else:
             # Fallback: use last few values as estimate
-            bootstrap_gap_inf.append(np.mean(virtual_gap[-5:]))
+            bootstrap_samples.append(np.mean(virtual_gap[-5:]))
             n_failures += 1
 
     if verbose and n_failures > 0:
         print(f"  Warning: {n_failures}/{n_bootstrap} fits failed, used fallback")
 
-    bootstrap_gap_inf = np.array(bootstrap_gap_inf)
+    bootstrap_samples = np.array(bootstrap_samples)
 
     # Step 3: Compute statistics
-    ci_95 = (np.percentile(bootstrap_gap_inf, 2.5),
-             np.percentile(bootstrap_gap_inf, 97.5))
-    ci_90 = (np.percentile(bootstrap_gap_inf, 5),
-             np.percentile(bootstrap_gap_inf, 95))
+    ci_95 = (np.percentile(bootstrap_samples, 2.5),
+             np.percentile(bootstrap_samples, 97.5))
+    ci_90 = (np.percentile(bootstrap_samples, 5),
+             np.percentile(bootstrap_samples, 95))
 
     # Fraction positive
-    frac_positive = np.mean(bootstrap_gap_inf > 0)
+    frac_positive = np.mean(bootstrap_samples > 0)
 
     return {
         'success': True,
         'gap_inf': point_fit['gap_inf'],
         'ci_95': ci_95,
         'ci_90': ci_90,
-        'se': np.std(bootstrap_gap_inf),
-        'bootstrap_samples': bootstrap_gap_inf,
+        'se': np.std(bootstrap_samples),
+        'bootstrap_samples': bootstrap_samples,
         'frac_positive': frac_positive,
         'point_fit': point_fit,
-        'chosen_model': chosen_model,
         'n_fit_failures': n_failures
+    }
+
+
+def bootstrap_exp_and_power(steps, gaps_all_runs, n_bootstrap=5000, verbose=True):
+    """Bootstrap exponential and power law models to compare asymptotic estimates.
+
+    Bootstraps the two main competing models (exponential vs power law) to
+    check if they agree on gap_inf or show model uncertainty.
+
+    Returns:
+        dict with:
+            - per_model: {model_name: {gap_inf, ci_95, se, bootstrap_samples, n_failures}}
+            - agreement: bool (True if 95% CIs overlap)
+            - bic_selected: str (name of BIC-best model)
+            - success: bool
+    """
+    steps = np.array(steps, dtype=float)
+    gaps_all_runs = np.array(gaps_all_runs)
+    n_runs, n_steps = gaps_all_runs.shape
+
+    # Fit both models to mean trajectory for BIC comparison
+    mean_gap = np.mean(gaps_all_runs, axis=0)
+
+    exp_fit = fit_single_exp(steps, mean_gap)
+    power_fit = fit_power_law(steps, mean_gap)
+
+    if not exp_fit['success'] or not power_fit['success']:
+        return {'success': False}
+
+    # Select BIC-best
+    models = {
+        'Single exponential': exp_fit,
+        'Power law': power_fit
+    }
+    bic_selected = min(models.keys(), key=lambda k: models[k]['bic'])
+
+    if verbose:
+        print(f"  BIC-selected model: {bic_selected}")
+        for name, fit in models.items():
+            marker = " <--" if name == bic_selected else ""
+            print(f"    {name}: BIC={fit['bic']:.1f}, RMSE={fit['rmse']:.5f}{marker}")
+
+    # Bootstrap each model
+    per_model_results = {}
+
+    # Calculate progress report interval (every 10% or at least every 100 iterations)
+    report_interval = max(100, n_bootstrap // 10)
+
+    for model_idx, (model_name, fit_func) in enumerate([('Single exponential', fit_single_exp),
+                                                          ('Power law', fit_power_law)]):
+        if verbose:
+            print(f"  [{model_idx + 1}/2] Bootstrapping {model_name}...")
+
+        bootstrap_samples = []
+        n_failures = 0
+        model_start = time.time()
+
+        for b in range(n_bootstrap):
+            if verbose and (b + 1) % report_interval == 0:
+                elapsed = time.time() - model_start
+                rate = (b + 1) / elapsed
+                eta = (n_bootstrap - b - 1) / rate
+                print(f"    {b + 1}/{n_bootstrap} ({elapsed:.1f}s elapsed, {eta:.1f}s remaining)")
+
+            run_choices = np.random.randint(0, n_runs, size=n_steps)
+            virtual_gap = gaps_all_runs[run_choices, np.arange(n_steps)]
+
+            result = fit_func(steps, virtual_gap)
+            if result['success']:
+                bootstrap_samples.append(result['gap_inf'])
+            else:
+                bootstrap_samples.append(np.mean(virtual_gap[-5:]))
+                n_failures += 1
+
+        bootstrap_samples = np.array(bootstrap_samples)
+        ci_95 = (np.percentile(bootstrap_samples, 2.5), np.percentile(bootstrap_samples, 97.5))
+
+        per_model_results[model_name] = {
+            'gap_inf': models[model_name]['gap_inf'],
+            'ci_95': ci_95,
+            'se': np.std(bootstrap_samples),
+            'bootstrap_samples': bootstrap_samples,
+            'frac_positive': np.mean(bootstrap_samples > 0),
+            'n_failures': n_failures,
+            'bic': models[model_name]['bic'],
+        }
+
+    # Check agreement
+    cis = [r['ci_95'] for r in per_model_results.values()]
+    max_low = max(ci[0] for ci in cis)
+    min_high = min(ci[1] for ci in cis)
+    agreement = max_low <= min_high
+
+    return {
+        'success': True,
+        'per_model': per_model_results,
+        'bic_selected': bic_selected,
+        'agreement': agreement,
     }
 
 
@@ -563,23 +657,29 @@ def bootstrap_all_models(steps, gaps_all_runs, n_bootstrap=5000, verbose=True):
         'Double exponential': fit_double_exp,
         'Single exponential': fit_single_exp,
         'Power law': fit_power_law,
-        'Double power law': fit_double_power_law,
     }
 
     # Bootstrap each successful model
     per_model_results = {}
 
-    for model_name in successful_models:
+    # Calculate progress report interval (every 10% or at least every 100 iterations)
+    report_interval = max(100, n_bootstrap // 10)
+
+    for model_idx, model_name in enumerate(successful_models):
         if verbose:
-            print(f"  Bootstrapping {model_name}...")
+            print(f"  [{model_idx + 1}/{len(successful_models)}] Bootstrapping {model_name}...")
 
         fit_func = fit_func_map[model_name]
         bootstrap_samples = []
         n_failures = 0
+        model_start = time.time()
 
         for b in range(n_bootstrap):
-            if verbose and (b + 1) % 2000 == 0:
-                print(f"    {b + 1}/{n_bootstrap}")
+            if verbose and (b + 1) % report_interval == 0:
+                elapsed = time.time() - model_start
+                rate = (b + 1) / elapsed
+                eta = (n_bootstrap - b - 1) / rate
+                print(f"    {b + 1}/{n_bootstrap} ({elapsed:.1f}s elapsed, {eta:.1f}s remaining)")
 
             run_choices = np.random.randint(0, n_runs, size=n_steps)
             virtual_gap = gaps_all_runs[run_choices, np.arange(n_steps)]
@@ -605,8 +705,9 @@ def bootstrap_all_models(steps, gaps_all_runs, n_bootstrap=5000, verbose=True):
             'rmse': successful_models[model_name]['rmse'],
         }
 
-        if verbose and n_failures > 0:
-            print(f"    {n_failures}/{n_bootstrap} fits failed")
+        if verbose:
+            model_elapsed = time.time() - model_start
+            print(f"    Done in {model_elapsed:.1f}s" + (f" ({n_failures} fits failed)" if n_failures > 0 else ""))
 
     # Check agreement: do all 95% CIs overlap?
     intervals = [per_model_results[k]['ci_95'] for k in per_model_results]
@@ -858,11 +959,14 @@ def run_alpha_sweep_all_models(checkpoints_dir='checkpoints', data_path='data/co
 def permutation_test_sectors(checkpoint_path, data_path='data/combined_for_experiment.npz',
                              n_permutations=1000, layer=2, alpha=1.0,
                              n_samples=2000, device=None, verbose=True):
-    """Test if probe R² drops when sector indices are shuffled.
+    """Test if probe learned the specific spatial sector mapping.
 
-    Null hypothesis: Sector targets have no relationship to activations.
-    Under H0, shuffling which 4x4 region gets which target value shouldn't
-    systematically reduce R².
+    Trains a probe on correct sector labels, then tests whether R² drops
+    when sector columns are permuted at evaluation time. This tests whether
+    the probe learned which 4x4 region corresponds to which output.
+
+    If R² drops significantly under permutation, the probe learned the
+    specific spatial structure, not just that sectors are predictable.
 
     Args:
         checkpoint_path: Path to model checkpoint
@@ -946,7 +1050,7 @@ def permutation_test_sectors(checkpoint_path, data_path='data/combined_for_exper
     X_train, X_val = X[train_idx], X[val_idx]
     Y_train, Y_val = Y[train_idx], Y[val_idx]
 
-    # True R²
+    # Train probe once on correct labels
     probe = Ridge(alpha=alpha)
     probe.fit(X_train, Y_train)
     true_r2 = probe.score(X_val, Y_val)
@@ -955,34 +1059,35 @@ def permutation_test_sectors(checkpoint_path, data_path='data/combined_for_exper
         print(f"  True R²: {true_r2:.4f}")
         print(f"  Running {n_permutations} permutations...")
 
-    # Permutation test: shuffle sector indices (not samples!)
+    # Permutation test: train on correct, test on permuted
+    # This tests whether the probe learned the specific spatial mapping
     null_r2 = []
     for p in range(n_permutations):
         if verbose and (p + 1) % 200 == 0:
             print(f"    {p + 1}/{n_permutations}")
 
-        # Permute the 16 sector columns
+        # Permute the 16 sector columns at test time only
         perm = np.random.permutation(16)
-        Y_train_perm = Y_train[:, perm]
         Y_val_perm = Y_val[:, perm]
 
-        probe = Ridge(alpha=alpha)
-        probe.fit(X_train, Y_train_perm)
+        # Evaluate the SAME probe (trained on correct labels) on permuted targets
         r2 = probe.score(X_val, Y_val_perm)
         null_r2.append(r2)
 
     null_r2 = np.array(null_r2)
+    # p-value: how often does permuted R² exceed true R²?
+    # If probe learned specific mapping, permuted R² should be lower
     p_value = np.mean(null_r2 >= true_r2)
 
     if verbose:
         print(f"\n  Results:")
         print(f"    True R²: {true_r2:.4f}")
-        print(f"    Null R² mean: {np.mean(null_r2):.4f} (std: {np.std(null_r2):.4f})")
+        print(f"    Permuted R² mean: {np.mean(null_r2):.4f} (std: {np.std(null_r2):.4f})")
         print(f"    p-value: {p_value:.4f}")
         if p_value < 0.01:
-            print(f"    --> SIGNIFICANT: Sector structure matters (p < 0.01)")
+            print(f"    --> SIGNIFICANT: Probe learned specific spatial mapping (p < 0.01)")
         else:
-            print(f"    --> NOT significant: Sector structure may not matter")
+            print(f"    --> NOT significant: Probe may not encode spatial structure")
 
     return {
         'true_r2': true_r2,
@@ -1004,12 +1109,12 @@ def plot_permutation_test(result, output_path):
     true_r2 = result['true_r2']
 
     ax.hist(null_dist, bins=50, density=True, alpha=0.7, color='steelblue',
-            edgecolor='white', label=f'Null distribution (n={len(null_dist)})')
+            edgecolor='white', label=f'Permuted R² (n={len(null_dist)})')
 
     ax.axvline(true_r2, color='red', linewidth=2, linestyle='-',
                label=f'True R² = {true_r2:.4f}')
     ax.axvline(np.mean(null_dist), color='orange', linewidth=2, linestyle='--',
-               label=f'Null mean = {np.mean(null_dist):.4f}')
+               label=f'Permuted mean = {np.mean(null_dist):.4f}')
 
     # p-value annotation
     p_val = result['p_value']
@@ -1018,16 +1123,16 @@ def plot_permutation_test(result, output_path):
     else:
         p_text = f"p = {p_val:.3f}"
 
-    sig_text = "SIGNIFICANT" if p_val < 0.01 else "Not significant"
+    sig_text = "Spatial mapping learned" if p_val < 0.01 else "No spatial specificity"
     color = 'green' if p_val < 0.01 else 'orange'
 
     ax.text(0.95, 0.95, f"{p_text}\n{sig_text}", transform=ax.transAxes,
             fontsize=11, verticalalignment='top', horizontalalignment='right',
             bbox=dict(boxstyle='round', facecolor=color, alpha=0.3))
 
-    ax.set_xlabel('Probe R²', fontsize=11)
+    ax.set_xlabel('Probe R² (permuted sectors)', fontsize=11)
     ax.set_ylabel('Density', fontsize=11)
-    ax.set_title(f'Permutation Test (Layer {result["layer"]})', fontsize=12)
+    ax.set_title(f'Spatial Mapping Test (Layer {result["layer"]})', fontsize=12)
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -1112,33 +1217,31 @@ def plot_layer_comparison(results, output_path):
         'Large+embed(noaux)': '#ff7f0e',
     }
 
-    # Panel 1: Layer profiles
+    # Panel 1: Baseline layer profile (bar chart)
     ax = axes[0]
-    for model_type, profile in results['layer_profiles'].items():
-        layers = sorted(profile.keys(), key=lambda x: (x < 0, x))
-        r2_values = [profile[l] for l in layers]
-        x_labels = [str(l) if l >= 0 else 'post-LN' for l in layers]
+    baseline_profile = results['layer_profiles'].get('Large-baseline', {})
+    baseline_seed_data = results['seed_data'].get('Large-baseline', {})
 
-        ax.plot(range(len(layers)), r2_values, 'o-', color=model_colors.get(model_type, 'gray'),
-                linewidth=2, markersize=8, label=model_type)
+    layers = sorted(baseline_profile.keys(), key=lambda x: (x < 0, x))
+    r2_values = [baseline_profile[l] for l in layers]
+    stds = [np.std(baseline_seed_data.get(l, [0])) for l in layers]
+    x_labels = [str(l) if l >= 0 else 'post-LN' for l in layers]
 
-        # Add error bars if we have seed data
-        if model_type in results['seed_data']:
-            seed_data = results['seed_data'][model_type]
-            stds = [np.std(seed_data.get(l, [0])) for l in layers]
-            ax.fill_between(range(len(layers)),
-                           np.array(r2_values) - np.array(stds),
-                           np.array(r2_values) + np.array(stds),
-                           alpha=0.2, color=model_colors.get(model_type, 'gray'))
+    bars = ax.bar(range(len(layers)), r2_values, color='#1f77b4', alpha=0.7,
+                  yerr=stds, capsize=4, error_kw={'linewidth': 1.5})
+
+    # Highlight layer 2 (embedded layer)
+    if 2 in layers:
+        layer_2_idx = layers.index(2)
+        bars[layer_2_idx].set_color('#d62728')
+        bars[layer_2_idx].set_alpha(0.8)
 
     ax.set_xticks(range(len(layers)))
     ax.set_xticklabels(x_labels)
-    ax.axvline(2, color='red', linestyle='--', alpha=0.5, label='Layer 2 (embedded)')
     ax.set_xlabel('Layer', fontsize=11)
     ax.set_ylabel('Final Probe R²', fontsize=11)
-    ax.set_title('Probe R² by Layer', fontsize=12)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    ax.set_title('Baseline Model: R² by Layer', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
 
     # Panel 2: Layer 2 prominence
     ax = axes[1]
@@ -1243,6 +1346,419 @@ def check_bootstrap_convergence(samples, checkpoints=None):
 
 
 # =============================================================================
+# Autocorrelation Tests for Bootstrap Validity
+# =============================================================================
+
+def compute_within_acf(gaps_all_runs, max_lag):
+    """Compute within-seed autocorrelation function.
+
+    For each seed, computes autocorrelation at lags 1..max_lag, then averages
+    across seeds.
+
+    Args:
+        gaps_all_runs: (n_runs, n_steps) array of gap values
+        max_lag: Maximum lag to compute
+
+    Returns:
+        (max_lag,) array of within-seed autocorrelations
+    """
+    n_runs, n_steps = gaps_all_runs.shape
+    within_acf = np.zeros(max_lag)
+
+    for lag in range(1, max_lag + 1):
+        acf_values = []
+        for seed_idx in range(n_runs):
+            series = gaps_all_runs[seed_idx, :]
+            if len(series) > lag:
+                # Pearson correlation between series[:-lag] and series[lag:]
+                x = series[:-lag]
+                y = series[lag:]
+                if len(x) > 1 and np.std(x) > 1e-10 and np.std(y) > 1e-10:
+                    acf = np.corrcoef(x, y)[0, 1]
+                    if not np.isnan(acf):
+                        acf_values.append(acf)
+
+        within_acf[lag - 1] = np.mean(acf_values) if acf_values else 0.0
+
+    return within_acf
+
+
+def compute_between_ccf(gaps_all_runs, max_lag):
+    """Compute between-seed cross-correlation function.
+
+    For each pair of different seeds, computes cross-correlation at lags 1..max_lag,
+    then averages across all pairs.
+
+    Args:
+        gaps_all_runs: (n_runs, n_steps) array of gap values
+        max_lag: Maximum lag to compute
+
+    Returns:
+        (max_lag,) array of between-seed cross-correlations
+    """
+    n_runs, n_steps = gaps_all_runs.shape
+    between_ccf = np.zeros(max_lag)
+
+    for lag in range(1, max_lag + 1):
+        ccf_values = []
+        for i in range(n_runs):
+            for j in range(n_runs):
+                if i != j:
+                    series_i = gaps_all_runs[i, :]
+                    series_j = gaps_all_runs[j, :]
+                    if len(series_i) > lag:
+                        # Cross-correlation: series_i[:-lag] vs series_j[lag:]
+                        x = series_i[:-lag]
+                        y = series_j[lag:]
+                        if len(x) > 1 and np.std(x) > 1e-10 and np.std(y) > 1e-10:
+                            ccf = np.corrcoef(x, y)[0, 1]
+                            if not np.isnan(ccf):
+                                ccf_values.append(ccf)
+
+        between_ccf[lag - 1] = np.mean(ccf_values) if ccf_values else 0.0
+
+    return between_ccf
+
+
+def permutation_test_autocorr(gaps_all_runs, max_lag, n_permutations, observed_tr):
+    """Generate null distribution by shuffling within each seed.
+
+    Tests whether observed threat ratios are significantly higher than would
+    be expected by chance. Shuffles time points within each seed independently
+    to destroy temporal structure while preserving marginal distribution.
+
+    Args:
+        gaps_all_runs: (n_runs, n_steps) array of gap values
+        max_lag: Maximum lag to test
+        n_permutations: Number of permutation iterations
+        observed_tr: (max_lag,) array of observed threat ratios
+
+    Returns:
+        p_values: (max_lag,) array of p-values (fraction of null >= observed)
+        null_distribution: (n_permutations, max_lag) array of null threat ratios
+    """
+    n_runs, n_steps = gaps_all_runs.shape
+    null_threat_ratios = np.zeros((n_permutations, max_lag))
+
+    for perm_idx in range(n_permutations):
+        # Shuffle each seed's trajectory independently
+        shuffled = np.zeros_like(gaps_all_runs)
+        for i in range(n_runs):
+            perm = np.random.permutation(n_steps)
+            shuffled[i, :] = gaps_all_runs[i, perm]
+
+        # Compute ACF and CCF on shuffled data
+        within_null = compute_within_acf(shuffled, max_lag)
+        between_null = compute_between_ccf(shuffled, max_lag)
+
+        # Compute threat ratios
+        epsilon = 1e-6
+        tr_null = within_null / (np.abs(between_null) + epsilon)
+        tr_null = np.minimum(tr_null, 100.0)
+        null_threat_ratios[perm_idx, :] = tr_null
+
+    # Compute p-values for each lag
+    p_values = np.mean(null_threat_ratios >= observed_tr[np.newaxis, :], axis=0)
+
+    return p_values, null_threat_ratios
+
+
+def compute_effective_n(acf_values, n_steps):
+    """Compute effective sample size using Bartlett's formula.
+
+    Formula: n_eff = n / (1 + 2 * sum(rho_k))
+    where sum is over significant autocorrelations.
+
+    Args:
+        acf_values: Array of autocorrelation values at lags 1, 2, ...
+        n_steps: Actual number of time points
+
+    Returns:
+        n_eff: Effective sample size
+        vif: Variance inflation factor (n_steps / n_eff)
+    """
+    # Sum autocorrelations up to cutoff
+    K = min(len(acf_values), n_steps // 4)
+    acf_sum = 0.0
+
+    for k, acf_k in enumerate(acf_values[:K]):
+        if abs(acf_k) < 0.05:  # Insignificant autocorrelation
+            break
+        acf_sum += acf_k
+
+    # Ensure denominator is positive
+    denominator = max(1.0, 1 + 2 * acf_sum)
+    n_eff = n_steps / denominator
+    vif = n_steps / n_eff
+
+    return n_eff, vif
+
+
+def classify_threat(threat_ratio, p_values, vif, within_acf):
+    """Classify overall threat to bootstrap validity.
+
+    Uses multiple criteria for robustness:
+    1. Threat ratio magnitude (within vs between strength)
+    2. Statistical significance (permutation test)
+    3. Variance inflation (effective sample size reduction)
+    4. Absolute autocorrelation level
+
+    Args:
+        threat_ratio: (max_lag,) array of threat ratios
+        p_values: (max_lag,) array of p-values
+        vif: Variance inflation factor
+        within_acf: (max_lag,) array of within-seed autocorrelations
+
+    Returns:
+        'low', 'moderate', or 'high'
+    """
+    # Focus on lag 1 (most critical for bootstrap)
+    tr_lag1 = threat_ratio[0]
+    p_lag1 = p_values[0]
+    acf_lag1 = within_acf[0]
+
+    # High threat criteria (all must be met):
+    if tr_lag1 > 3 and p_lag1 < 0.05 and vif > 2 and acf_lag1 > 0.5:
+        return 'high'
+
+    # Moderate threat criteria (any two):
+    moderate_flags = [
+        tr_lag1 > 2,
+        p_lag1 < 0.1,
+        vif > 1.5,
+        acf_lag1 > 0.3
+    ]
+    if sum(moderate_flags) >= 2:
+        return 'moderate'
+
+    return 'low'
+
+
+def generate_autocorr_recommendation(threat_level, within_acf, vif, between_ccf):
+    """Generate actionable recommendation based on threat level.
+
+    Args:
+        threat_level: 'low', 'moderate', or 'high'
+        within_acf: (max_lag,) array of within-seed autocorrelations
+        vif: Variance inflation factor
+        between_ccf: (max_lag,) array of between-seed cross-correlations
+
+    Returns:
+        dict with 'use_block_bootstrap' flag and 'message' text
+    """
+    if threat_level == 'high':
+        # Estimate decorrelation time
+        block_size = int(np.ceil(1 / max(0.1, 1 - within_acf[0])))
+        block_size = min(block_size, 5)
+
+        return {
+            'use_block_bootstrap': True,
+            'block_size': block_size,
+            'message': (
+                f"HIGH THREAT (VIF={vif:.2f}): Within-seed autocorrelation "
+                f"(ACF[1]={within_acf[0]:.3f}) is significantly higher than "
+                f"between-seed correlation (CCF[1]={between_ccf[0]:.3f}). "
+                "The current bootstrap method likely UNDERESTIMATES variance.\n\n"
+                f"RECOMMENDATION: Use block bootstrap with block_size={block_size} "
+                "to preserve temporal structure within seeds. This will produce wider "
+                "(more conservative) confidence intervals that properly account for "
+                "autocorrelation."
+            )
+        }
+
+    elif threat_level == 'moderate':
+        return {
+            'use_block_bootstrap': False,
+            'message': (
+                f"MODERATE: Some autocorrelation detected (VIF={vif:.2f}). "
+                f"Within-seed ACF[1]={within_acf[0]:.3f}, "
+                f"between-seed CCF[1]={between_ccf[0]:.3f}. "
+                "Bootstrap variance estimates may be slightly optimistic (10-30% too narrow) "
+                "but likely acceptable for exploratory analysis.\n\n"
+                "SUGGESTION: Interpret confidence intervals cautiously. Consider sensitivity "
+                "analysis with block bootstrap if results are borderline significant."
+            )
+        }
+
+    else:  # low
+        return {
+            'use_block_bootstrap': False,
+            'message': (
+                f"LOW THREAT (VIF={vif:.2f}): Autocorrelation structure does not "
+                "substantially threaten bootstrap validity. Within-seed and between-seed "
+                "correlations are comparable, supporting the exchangeability assumption.\n\n"
+                "CONCLUSION: Current bootstrap method is appropriate. Confidence intervals "
+                "should be reliable."
+            )
+        }
+
+
+def generate_autocorr_interpretation(result):
+    """Generate detailed human-readable interpretation.
+
+    Args:
+        result: Dict with autocorrelation test results
+
+    Returns:
+        Multi-line string with formatted interpretation
+    """
+    lines = []
+    lines.append("=" * 70)
+    lines.append("Autocorrelation Diagnostic")
+    lines.append("=" * 70)
+    lines.append("")
+
+    lines.append(f"Data: {result['n_runs']} seeds, {result['n_steps']} time points")
+    lines.append("")
+
+    lines.append("Within-Seed Autocorrelation (ACF):")
+    for lag, acf in enumerate(result['within_seed_acf'], 1):
+        lines.append(f"  Lag {lag}: {acf:7.3f}")
+    lines.append("")
+
+    lines.append("Between-Seed Cross-Correlation (CCF):")
+    for lag, ccf in enumerate(result['between_seed_ccf'], 1):
+        lines.append(f"  Lag {lag}: {ccf:7.3f}")
+    lines.append("")
+
+    lines.append("Threat Ratio (Within/Between):")
+    for lag, (tr, pval) in enumerate(zip(result['threat_ratio'], result['p_values']), 1):
+        sig = " ***" if pval < 0.01 else " **" if pval < 0.05 else " *" if pval < 0.1 else ""
+        lines.append(f"  Lag {lag}: {tr:7.2f} (p={pval:.3f}){sig}")
+    lines.append("")
+
+    lines.append(f"Effective Sample Size (within-seed): {result['n_eff']:.1f} / {result['n_steps']}")
+    lines.append(f"Variance Inflation Factor: {result['vif']:.2f}")
+    lines.append("")
+
+    # Interpretation note without prescriptive classification
+    lines.append("Interpretation:")
+    lines.append("  - Threat ratio ≈ 1: Seeds have similar temporal dynamics")
+    lines.append("  - Threat ratio >> 1: Within-seed structure much stronger (mixing seeds problematic)")
+    lines.append("  - High VIF: Limited effective observations due to autocorrelation")
+    lines.append("  - With only 3 seeds, bootstrap uncertainty estimates should be interpreted cautiously")
+    lines.append("")
+    lines.append("=" * 70)
+
+    return "\n".join(lines)
+
+
+def test_autocorrelation_structure(steps, gaps_all_runs, max_lag=5,
+                                   n_permutations=1000, verbose=True):
+    """Test if within-seed autocorrelation threatens bootstrap validity.
+
+    Tests whether the bootstrap assumption of exchangeability across seeds
+    is violated by temporal autocorrelation within seeds.
+
+    The current bootstrap method (lines 480-482) creates virtual trajectories
+    by randomly selecting which seed to use at each time point. This assumes
+    gap values at each time point are exchangeable across seeds. If successive
+    values within a seed are highly correlated (strong temporal structure),
+    but correlation between seeds is weak, then mixing seeds across time points
+    creates unrealistic trajectories and underestimates variance.
+
+    Args:
+        steps: (n_steps,) array of probe evaluation steps (for plotting)
+        gaps_all_runs: (n_runs, n_steps) array of gap values
+        max_lag: Maximum lag to test (default: 5, adequate for 20-40 time points)
+        n_permutations: Number of permutation test iterations (default: 1000)
+        verbose: Print detailed diagnostic output
+
+    Returns:
+        dict with:
+            - within_seed_acf: (max_lag,) array of within-seed autocorrelations
+            - between_seed_ccf: (max_lag,) array of between-seed cross-correlations
+            - threat_ratio: (max_lag,) array of threat ratios (within/between)
+            - p_values: (max_lag,) array of permutation test p-values
+            - n_eff: Effective sample size adjusted for autocorrelation
+            - vif: Variance inflation factor
+            - threat_level: 'low', 'moderate', or 'high'
+            - recommendation: Dict with use_block_bootstrap flag and message
+            - interpretation: Detailed text explanation
+            - steps: Copy of input steps (for plotting)
+            - gaps_all_runs: Copy of input gaps (for plotting)
+            - n_runs, n_steps, max_lag: Metadata
+            - success: True if test completed successfully
+    """
+    n_runs, n_steps = gaps_all_runs.shape
+
+    # Handle edge cases
+    if n_steps < 10:
+        return {
+            'success': False,
+            'message': 'Time series too short (n_steps < 10) for reliable autocorrelation estimation'
+        }
+
+    # Adjust max_lag if necessary
+    max_lag = min(max_lag, n_steps // 3)
+
+    if verbose:
+        print(f"  Computing autocorrelation structure ({n_runs} seeds, {n_steps} time points)...")
+
+    # Step 1: Compute ACF and CCF
+    within_acf = compute_within_acf(gaps_all_runs, max_lag)
+    between_ccf = compute_between_ccf(gaps_all_runs, max_lag)
+
+    # Step 2: Compute threat ratios
+    epsilon = 1e-6
+    threat_ratio = within_acf / (np.abs(between_ccf) + epsilon)
+    threat_ratio = np.minimum(threat_ratio, 100.0)
+
+    if verbose:
+        print(f"    Within-seed ACF[1]: {within_acf[0]:.3f}")
+        print(f"    Between-seed CCF[1]: {between_ccf[0]:.3f}")
+        print(f"    Threat ratio[1]: {threat_ratio[0]:.2f}")
+
+    # Step 3: Permutation test
+    if verbose:
+        print(f"    Running permutation test ({n_permutations} iterations)...")
+
+    p_values, null_distribution = permutation_test_autocorr(
+        gaps_all_runs, max_lag, n_permutations, threat_ratio
+    )
+
+    # Step 4: Effective sample size
+    n_eff, vif = compute_effective_n(within_acf, n_steps)
+
+    if verbose:
+        print(f"    Effective sample size: {n_eff:.1f} (VIF={vif:.2f})")
+        print(f"    Permutation p-value[1]: {p_values[0]:.3f}")
+
+    # Step 5: Classify threat level
+    threat_level = classify_threat(threat_ratio, p_values, vif, within_acf)
+
+    # Step 6: Generate recommendations
+    recommendation = generate_autocorr_recommendation(threat_level, within_acf, vif, between_ccf)
+
+    # Step 7: Generate interpretation text
+    result = {
+        'success': True,
+        'within_seed_acf': within_acf,
+        'between_seed_ccf': between_ccf,
+        'threat_ratio': threat_ratio,
+        'p_values': p_values,
+        'null_distribution': null_distribution,
+        'n_eff': n_eff,
+        'vif': vif,
+        'threat_level': threat_level,
+        'recommendation': recommendation,
+        'steps': steps.copy() if isinstance(steps, np.ndarray) else np.array(steps),
+        'gaps_all_runs': gaps_all_runs.copy(),
+        'n_runs': n_runs,
+        'n_steps': n_steps,
+        'max_lag': max_lag
+    }
+
+    interpretation = generate_autocorr_interpretation(result)
+    result['interpretation'] = interpretation
+
+    if verbose:
+        print(f"\n{interpretation}")
+
+    return result
+
+
+# =============================================================================
 # Visualization
 # =============================================================================
 
@@ -1342,6 +1858,111 @@ def plot_analysis(steps, gaps_all_runs, bootstrap_result, title, output_path):
     print(f"  Saved plot to {output_path}")
 
 
+def plot_exp_vs_power_analysis(steps, gaps_all_runs, bootstrap_result, title, output_path):
+    """Create analysis figure comparing exponential and power law models.
+
+    Panel 1: Raw trajectories + both model fits
+    Panel 2: Bootstrap distributions for both models side-by-side
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    steps = np.array(steps)
+    gaps_all_runs = np.array(gaps_all_runs)
+    mean_gap = np.mean(gaps_all_runs, axis=0)
+
+    # Panel 1: Trajectories and both fits
+    ax = axes[0]
+
+    # Individual runs
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+    for i, gap_run in enumerate(gaps_all_runs):
+        ax.plot(steps, gap_run, 'o-', color=colors[i % len(colors)],
+                alpha=0.4, markersize=3, linewidth=1, label=f'Run {i+1}')
+
+    # Mean
+    ax.plot(steps, mean_gap, 'ko-', markersize=4, linewidth=2, label='Mean')
+
+    # Both model fits
+    t_fine = np.linspace(steps[0], steps[-1] * 1.5, 200)
+
+    # Exponential fit
+    exp_fit = fit_single_exp(steps, mean_gap)
+    if exp_fit['success']:
+        ax.plot(t_fine, exp_fit['model_func'](t_fine), '-', color='#377eb8',
+                linewidth=2.5, label=f"Exponential (gap_inf={exp_fit['gap_inf']:.4f})")
+        ax.axhline(exp_fit['gap_inf'], color='#377eb8', linestyle='--', alpha=0.5)
+
+    # Power law fit
+    power_fit = fit_power_law(steps, mean_gap)
+    if power_fit['success']:
+        ax.plot(t_fine, power_fit['model_func'](t_fine), '-', color='#4daf4a',
+                linewidth=2.5, label=f"Power law (gap_inf={power_fit['gap_inf']:.4f})")
+        ax.axhline(power_fit['gap_inf'], color='#4daf4a', linestyle='--', alpha=0.5)
+
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.axvline(steps[-1], color='orange', linestyle='--', alpha=0.5,
+               label='End of training')
+
+    ax.set_xlabel('Training Steps', fontsize=11)
+    ax.set_ylabel('Gap in Probe R²', fontsize=11)
+    ax.set_title(f'{title}\nModel Comparison', fontsize=12)
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Bootstrap distributions
+    ax = axes[1]
+
+    model_names = list(bootstrap_result['per_model'].keys())
+    model_colors = {'Single exponential': '#377eb8', 'Power law': '#4daf4a'}
+
+    positions = []
+    for idx, model_name in enumerate(model_names):
+        m = bootstrap_result['per_model'][model_name]
+        samples = m['bootstrap_samples']
+        position = idx
+        positions.append(position)
+
+        # Violin plot
+        parts = ax.violinplot([samples], positions=[position], widths=0.7,
+                              showmeans=False, showmedians=False, showextrema=False)
+        for pc in parts['bodies']:
+            pc.set_facecolor(model_colors.get(model_name, 'gray'))
+            pc.set_alpha(0.6)
+
+        # Mean and CI
+        gap_inf = m['gap_inf']
+        ci_low, ci_high = m['ci_95']
+
+        ax.plot(position, gap_inf, 'o', color='black', markersize=8, zorder=10)
+        ax.plot([position, position], [ci_low, ci_high], 'k-', linewidth=3, zorder=9)
+
+        # Annotate
+        is_best = model_name == bootstrap_result['bic_selected']
+        marker = " (BIC)" if is_best else ""
+        ax.text(position, ax.get_ylim()[1] * 0.95, f"{model_name.split()[0]}{marker}",
+                ha='center', va='top', fontsize=9, fontweight='bold' if is_best else 'normal')
+
+    ax.axhline(0, color='red', linestyle='--', alpha=0.7, linewidth=2, label='Zero gap')
+    ax.set_xticks(positions)
+    ax.set_xticklabels([])
+    ax.set_ylabel('Asymptotic Gap (gap_inf)', fontsize=11)
+    ax.set_title('Bootstrap Distributions', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Agreement indicator
+    agreement_text = "Models AGREE" if bootstrap_result['agreement'] else "Models DISAGREE"
+    agreement_color = 'green' if bootstrap_result['agreement'] else 'red'
+    ax.text(0.5, 0.05, agreement_text, transform=ax.transAxes,
+            fontsize=11, ha='center', va='bottom', fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor=agreement_color, alpha=0.3))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved plot to {output_path}")
+
+
 def plot_all_models_analysis(steps, gaps_all_runs, multi_result, title, output_path):
     """Create analysis figure showing ALL model fits and their bootstrap distributions.
 
@@ -1359,7 +1980,6 @@ def plot_all_models_analysis(steps, gaps_all_runs, multi_result, title, output_p
         'Double exponential': '#e41a1c',
         'Single exponential': '#377eb8',
         'Power law': '#4daf4a',
-        'Double power law': '#984ea3',
     }
 
     # Panel 1: Trajectories and ALL fits
@@ -1460,6 +2080,454 @@ def plot_all_models_analysis(steps, gaps_all_runs, multi_result, title, output_p
     print(f"  Saved plot to {output_path}")
 
 
+def plot_autocorrelation_diagnostic(result, output_path):
+    """Create diagnostic visualization for autocorrelation test.
+
+    Creates a 3-panel figure:
+    1. ACF vs CCF comparison (line plot)
+    2. Threat ratio by lag (bar plot with significance colors)
+    3. Raw time series by seed (shows whether seeds move together)
+
+    Args:
+        result: Dict returned by test_autocorrelation_structure()
+        output_path: Path to save the plot
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Panel 1: ACF vs CCF
+    ax = axes[0]
+    lags = np.arange(1, len(result['within_seed_acf']) + 1)
+
+    ax.plot(lags, result['within_seed_acf'], 'o-', color='steelblue',
+            linewidth=2.5, markersize=8, label='Within-seed ACF', zorder=3)
+    ax.plot(lags, result['between_seed_ccf'], 's--', color='darkorange',
+            linewidth=2.5, markersize=7, label='Between-seed CCF', zorder=3)
+
+    # Fill between to show gap
+    fill_color = 'red' if result['threat_level'] == 'high' else 'orange' if result['threat_level'] == 'moderate' else 'gray'
+    ax.fill_between(lags, result['within_seed_acf'], result['between_seed_ccf'],
+                    alpha=0.2, color=fill_color)
+
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.7, linewidth=1)
+    ax.set_xlabel('Lag', fontsize=12)
+    ax.set_ylabel('Correlation', fontsize=12)
+    ax.set_title('Autocorrelation Structure', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(lags)
+
+    # Panel 2: Threat Ratio with significance colors
+    ax = axes[1]
+
+    # Color by significance
+    colors = []
+    for p in result['p_values']:
+        if p < 0.01:
+            colors.append('#d62728')  # red
+        elif p < 0.05:
+            colors.append('#ff7f0e')  # orange
+        elif p < 0.1:
+            colors.append('#ffbb78')  # light orange
+        else:
+            colors.append('#2ca02c')  # green
+
+    bars = ax.bar(lags, result['threat_ratio'], color=colors, alpha=0.8,
+                  edgecolor='black', linewidth=1.5)
+
+    # Threshold lines
+    ax.axhline(1, color='gray', linestyle=':', linewidth=2, label='No threat (ratio=1)', zorder=1)
+    ax.axhline(2, color='orange', linestyle='--', linewidth=1.5, alpha=0.7,
+               label='Moderate threshold', zorder=1)
+    ax.axhline(3, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+               label='High threshold', zorder=1)
+
+    ax.set_xlabel('Lag', fontsize=12)
+    ax.set_ylabel('Threat Ratio (Within/Between)', fontsize=12)
+    ax.set_title('Bootstrap Threat Assessment', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=9, loc='upper right')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xticks(lags)
+    ax.set_ylim(bottom=0)
+
+    # Panel 3: Raw trajectories
+    ax = axes[2]
+    steps = result['steps']
+    gaps = result['gaps_all_runs']
+    n_runs = gaps.shape[0]
+
+    colors_seeds = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    for i in range(n_runs):
+        ax.plot(steps, gaps[i, :], 'o-', color=colors_seeds[i % len(colors_seeds)],
+                alpha=0.7, linewidth=2, markersize=5, label=f'Seed {i+1}')
+
+    # Add mean trajectory
+    mean_gaps = np.mean(gaps, axis=0)
+    ax.plot(steps, mean_gaps, 'k--', linewidth=2.5, alpha=0.7, label='Mean', zorder=10)
+
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('Training Steps', fontsize=12)
+    ax.set_ylabel('Gap Value (R²)', fontsize=12)
+    ax.set_title('Raw Time Series by Seed', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+
+    # Overall title
+    vif_text = f"VIF={result['vif']:.2f}"
+    tr_text = f"TR={result['threat_ratio'][0]:.2f}"
+    acf_text = f"ACF={result['within_seed_acf'][0]:.2f}"
+    ccf_text = f"CCF={result['between_seed_ccf'][0]:.2f}"
+
+    fig.suptitle(
+        f"Autocorrelation Diagnostic: {acf_text}, {ccf_text}, {tr_text}, {vif_text}",
+        fontsize=14, fontweight='bold', y=0.98
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved autocorrelation diagnostic plot to {output_path}")
+
+
+# =============================================================================
+# Horizon Analysis
+# =============================================================================
+
+def analyze_horizon_stability(histories, cond_a, cond_b, label, layer='2',
+                               horizons=None, n_bootstrap=300, verbose=True):
+    """Analyze how gap_inf estimates change with different data horizons.
+
+    Compares all 3 models (single exp, double exp, power law) to see which
+    gives stable predictions with less training data.
+
+    Args:
+        histories: Dict of training histories
+        cond_a, cond_b: Condition patterns to compare
+        label: Display label for this comparison
+        layer: Which layer to analyze
+        horizons: List of max training steps to use (default: fractions [0.2, 0.4, 0.6, 0.8, 1.0] of full data)
+        n_bootstrap: Bootstrap iterations per horizon per model
+
+    Returns:
+        Dict with results per horizon per model
+    """
+    # Extract full data
+    steps, gaps, seeds = extract_gap_data(histories, cond_a, cond_b, layer)
+    steps = np.array(steps)
+    gaps = np.array(gaps)
+
+    if horizons is None:
+        # Use fractions of full data to align with cross-validation
+        max_steps = steps[-1]
+        horizons = [int(max_steps * frac) for frac in [0.2, 0.4, 0.6, 0.8, 1.0]]
+
+    # Ensure horizons don't exceed data
+    horizons = [h for h in horizons if h <= steps[-1]]
+    if steps[-1] not in horizons:
+        horizons.append(steps[-1])
+    horizons = sorted(horizons)
+
+    if verbose:
+        print(f"\n  Analyzing {len(horizons)} horizons: {horizons}")
+
+    fit_funcs = {
+        'Single exponential': fit_single_exp,
+        'Double exponential': fit_double_exp,
+        'Power law': fit_power_law,
+    }
+
+    results = {model: [] for model in fit_funcs}
+    results['horizons'] = horizons
+
+    for horizon in horizons:
+        # Truncate data to this horizon
+        mask = steps <= horizon
+        steps_trunc = steps[mask]
+        gaps_trunc = gaps[:, mask]
+
+        if verbose:
+            print(f"\n  Horizon {horizon} ({len(steps_trunc)} points):")
+
+        mean_gap = np.mean(gaps_trunc, axis=0)
+        n_runs, n_steps = gaps_trunc.shape
+
+        for model_name, fit_func in fit_funcs.items():
+            # Point estimate
+            point_fit = fit_func(steps_trunc, mean_gap)
+
+            if not point_fit['success']:
+                results[model_name].append({
+                    'horizon': horizon,
+                    'gap_inf': np.nan,
+                    'ci_95': (np.nan, np.nan),
+                    'success': False
+                })
+                if verbose:
+                    print(f"    {model_name}: FAILED")
+                continue
+
+            # Bootstrap
+            bootstrap_samples = []
+            for _ in range(n_bootstrap):
+                run_choices = np.random.randint(0, n_runs, size=n_steps)
+                virtual_gap = gaps_trunc[run_choices, np.arange(n_steps)]
+                result = fit_func(steps_trunc, virtual_gap)
+                if result['success']:
+                    bootstrap_samples.append(result['gap_inf'])
+                else:
+                    bootstrap_samples.append(np.mean(virtual_gap[-3:]))
+
+            bootstrap_samples = np.array(bootstrap_samples)
+            ci_95 = (np.percentile(bootstrap_samples, 2.5), np.percentile(bootstrap_samples, 97.5))
+
+            results[model_name].append({
+                'horizon': horizon,
+                'gap_inf': point_fit['gap_inf'],
+                'ci_95': ci_95,
+                'se': np.std(bootstrap_samples),
+                'success': True
+            })
+
+            if verbose:
+                print(f"    {model_name}: gap_inf={point_fit['gap_inf']:.4f} CI=[{ci_95[0]:.4f}, {ci_95[1]:.4f}]")
+
+    return results
+
+
+def plot_horizon_stability(results, output_path, title="Horizon Stability"):
+    """Plot gap_inf estimates vs training horizon for all models."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    model_colors = {
+        'Single exponential': '#377eb8',
+        'Double exponential': '#e41a1c',
+        'Power law': '#4daf4a',
+    }
+
+    horizons = results['horizons']
+    x = np.arange(len(horizons))
+
+    for model_name in ['Single exponential', 'Double exponential', 'Power law']:
+        if model_name not in results:
+            continue
+
+        model_results = results[model_name]
+        gap_infs = [r['gap_inf'] for r in model_results]
+        ci_lows = [r['ci_95'][0] for r in model_results]
+        ci_highs = [r['ci_95'][1] for r in model_results]
+
+        color = model_colors[model_name]
+        ax.plot(x, gap_infs, 'o-', color=color, linewidth=2, markersize=8, label=model_name)
+        ax.fill_between(x, ci_lows, ci_highs, color=color, alpha=0.15)
+
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{h//1000}k' for h in horizons])
+    ax.set_xlabel('Training Horizon (steps)', fontsize=11)
+    ax.set_ylabel('Estimated Asymptotic Gap (gap_inf)', fontsize=11)
+    ax.set_title(title, fontsize=12)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved horizon stability plot to {output_path}")
+
+
+def cross_validate_models(steps, gaps, train_fractions=None, verbose=True):
+    """Cross-validate models using out-of-sample prediction on held-out data.
+
+    For each train fraction:
+    - Fit each model to first train_fraction of mean trajectory
+    - Extrapolate to remaining data
+    - Compute prediction error on held-out data
+
+    This tests which model better predicts unseen future behavior.
+
+    Args:
+        steps: (n_steps,) array of training steps
+        gaps: (n_runs, n_steps) array of gap values
+        train_fractions: List of fractions for train/test splits (default: [0.2, 0.4, 0.6, 0.8])
+        verbose: Print progress
+
+    Returns:
+        dict with:
+            - train_fractions: array of train fractions tested
+            - models: dict mapping model_name -> {
+                'test_rmse': array of RMSE on test data for each fraction
+                'test_mae': array of MAE on test data for each fraction
+                'mean_test_rmse': average RMSE across all splits
+                'mean_test_mae': average MAE across all splits
+              }
+            - best_model: name of model with lowest mean test RMSE
+    """
+    steps = np.array(steps, dtype=float)
+    gaps = np.array(gaps)
+    n_runs, n_steps = gaps.shape
+    mean_gap = np.mean(gaps, axis=0)
+
+    if train_fractions is None:
+        train_fractions = [0.2, 0.4, 0.6, 0.8]
+
+    fit_funcs = {
+        'Single exponential': fit_single_exp,
+        'Double exponential': fit_double_exp,
+        'Power law': fit_power_law,
+        'Double power law': fit_double_power_law,
+    }
+
+    results = {
+        'train_fractions': train_fractions,
+        'models': {name: {'test_rmse': [], 'test_mae': []} for name in fit_funcs}
+    }
+
+    if verbose:
+        print(f"\n  Cross-validating models with {len(train_fractions)} train/test splits...")
+
+    for frac in train_fractions:
+        n_train = int(n_steps * frac)
+        n_test = n_steps - n_train
+
+        if n_test < 3:
+            if verbose:
+                print(f"    Skipping fraction {frac:.1f} (too few test points)")
+            continue
+
+        # Split data
+        steps_train = steps[:n_train]
+        steps_test = steps[n_train:]
+        gap_train = mean_gap[:n_train]
+        gap_test = mean_gap[n_train:]
+
+        if verbose:
+            print(f"\n    Train fraction {frac:.1f}: {n_train} train, {n_test} test points")
+            print(f"      Train range: [{steps_train[0]:.0f}, {steps_train[-1]:.0f}]")
+            print(f"      Test range: [{steps_test[0]:.0f}, {steps_test[-1]:.0f}]")
+
+        for model_name, fit_func in fit_funcs.items():
+            # Fit to training data
+            fit_result = fit_func(steps_train, gap_train)
+
+            if not fit_result['success']:
+                if verbose:
+                    print(f"        {model_name}: FAILED")
+                results['models'][model_name]['test_rmse'].append(np.nan)
+                results['models'][model_name]['test_mae'].append(np.nan)
+                continue
+
+            # Extrapolate to test data
+            pred_test = fit_result['model_func'](steps_test)
+
+            # Compute errors
+            rmse = np.sqrt(np.mean((gap_test - pred_test)**2))
+            mae = np.mean(np.abs(gap_test - pred_test))
+
+            results['models'][model_name]['test_rmse'].append(rmse)
+            results['models'][model_name]['test_mae'].append(mae)
+
+            if verbose:
+                print(f"        {model_name}: RMSE={rmse:.5f}, MAE={mae:.5f}")
+
+    # Compute means and identify best model
+    best_rmse = np.inf
+    best_model = None
+
+    for model_name, model_results in results['models'].items():
+        test_rmse = np.array([r for r in model_results['test_rmse'] if not np.isnan(r)])
+        test_mae = np.array([r for r in model_results['test_mae'] if not np.isnan(r)])
+
+        if len(test_rmse) > 0:
+            mean_rmse = np.mean(test_rmse)
+            mean_mae = np.mean(test_mae)
+            model_results['mean_test_rmse'] = mean_rmse
+            model_results['mean_test_mae'] = mean_mae
+
+            if mean_rmse < best_rmse:
+                best_rmse = mean_rmse
+                best_model = model_name
+
+    results['best_model'] = best_model
+
+    if verbose:
+        print(f"\n  Summary of out-of-sample prediction errors:")
+        for model_name, model_results in results['models'].items():
+            if 'mean_test_rmse' in model_results:
+                marker = " <-- BEST" if model_name == best_model else ""
+                print(f"    {model_name}: Mean RMSE={model_results['mean_test_rmse']:.5f}, "
+                      f"Mean MAE={model_results['mean_test_mae']:.5f}{marker}")
+
+    return results
+
+
+def plot_cross_validation(cv_results, output_path, title="Model Cross-Validation"):
+    """Plot cross-validation results showing prediction errors vs train fraction."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    model_colors = {
+        'Single exponential': '#377eb8',
+        'Double exponential': '#e41a1c',
+        'Power law': '#4daf4a',
+        'Double power law': '#984ea3',
+    }
+
+    train_fracs = cv_results['train_fractions']
+
+    # Panel 1: RMSE
+    ax = axes[0]
+    for model_name, model_results in cv_results['models'].items():
+        rmse_vals = model_results['test_rmse']
+        color = model_colors.get(model_name, 'gray')
+
+        # Only plot where we have valid data
+        valid_mask = [not np.isnan(r) for r in rmse_vals]
+        valid_fracs = [f for f, v in zip(train_fracs, valid_mask) if v]
+        valid_rmse = [r for r, v in zip(rmse_vals, valid_mask) if v]
+
+        if valid_rmse:
+            marker = 'o' if model_name == cv_results['best_model'] else 's'
+            linewidth = 2.5 if model_name == cv_results['best_model'] else 1.5
+            ax.plot(valid_fracs, valid_rmse, marker=marker, color=color,
+                   linewidth=linewidth, markersize=8, label=model_name)
+
+    ax.set_xlabel('Train Fraction', fontsize=11)
+    ax.set_ylabel('Test RMSE (out-of-sample)', fontsize=11)
+    ax.set_title('Prediction Error vs Training Data', fontsize=12)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: MAE
+    ax = axes[1]
+    for model_name, model_results in cv_results['models'].items():
+        mae_vals = model_results['test_mae']
+        color = model_colors.get(model_name, 'gray')
+
+        valid_mask = [not np.isnan(m) for m in mae_vals]
+        valid_fracs = [f for f, v in zip(train_fracs, valid_mask) if v]
+        valid_mae = [m for m, v in zip(mae_vals, valid_mask) if v]
+
+        if valid_mae:
+            marker = 'o' if model_name == cv_results['best_model'] else 's'
+            linewidth = 2.5 if model_name == cv_results['best_model'] else 1.5
+            ax.plot(valid_fracs, valid_mae, marker=marker, color=color,
+                   linewidth=linewidth, markersize=8, label=model_name)
+
+    ax.set_xlabel('Train Fraction', fontsize=11)
+    ax.set_ylabel('Test MAE (out-of-sample)', fontsize=11)
+    ax.set_title('Mean Absolute Error vs Training Data', fontsize=12)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved cross-validation plot to {output_path}")
+
+
 # =============================================================================
 # Main Analysis
 # =============================================================================
@@ -1473,9 +2541,9 @@ def analyze_comparison(histories, cond_a, cond_b, label, layer='2',
         cond_a, cond_b: Condition patterns to compare
         label: Display label for this comparison
         layer: Which layer to analyze (default: '2' = embedded layer)
-        n_bootstrap: Number of bootstrap iterations
+        n_bootstrap: Number of bootstrap iterations (default: 5000)
         plots_dir: Directory for output plots
-        all_models: If True, bootstrap ALL 4 models and check agreement
+        all_models: If True, bootstrap ALL 4 models; else bootstrap exp+power (default)
     """
     print(f"\n{'='*60}")
     print(f"  {label}")
@@ -1543,32 +2611,97 @@ def analyze_comparison(histories, cond_a, cond_b, label, layer='2',
         result['frac_positive'] = bic_model['frac_positive']
 
     else:
-        result = bootstrap_gap_inf(steps, gaps, n_bootstrap, verbose=True)
+        # Bootstrap exponential and power law models
+        result = bootstrap_exp_and_power(steps, gaps, n_bootstrap, verbose=True)
 
         if not result['success']:
             print("  Bootstrap failed")
             return None
 
-        # Report
-        print(f"\n  === Results ===")
-        print(f"  Best model: {result['point_fit']['name']}")
-        print(f"  gap_inf: {result['gap_inf']:.4f} (SE: {result['se']:.4f})")
-        print(f"  95% CI: [{result['ci_95'][0]:.4f}, {result['ci_95'][1]:.4f}]")
+        # Report per-model results
+        print(f"\n  === Results (Exponential vs Power Law) ===")
+        for model_name, m in result['per_model'].items():
+            is_best = model_name == result['bic_selected']
+            best_marker = " [BIC best]" if is_best else ""
+            print(f"  {model_name}{best_marker}:")
+            print(f"    gap_inf: {m['gap_inf']:.4f} (SE: {m['se']:.4f})")
+            print(f"    95% CI: [{m['ci_95'][0]:.4f}, {m['ci_95'][1]:.4f}]")
+            if m['n_failures'] > 0:
+                print(f"    Note: {m['n_failures']}/{n_bootstrap} fits failed (used fallback)")
 
-        if result['ci_95'][0] > 0:
-            print(f"  --> CI EXCLUDES ZERO: Evidence for persistent advantage")
-        elif result['ci_95'][1] < 0:
-            print(f"  --> CI EXCLUDES ZERO: Evidence for persistent disadvantage")
+        # Report agreement
+        print(f"\n  Model Agreement: {'YES' if result['agreement'] else 'NO'}")
+        if result['agreement']:
+            print(f"  --> Both models agree on sign/significance of persistent gap")
         else:
-            print(f"  --> CI includes zero ({100*result['frac_positive']:.0f}% of bootstrap positive)")
+            print(f"  --> Models disagree - suggests model uncertainty or regime transition")
 
-        # Fit quality
-        if result['n_fit_failures'] > 0:
-            print(f"\n  Note: {result['n_fit_failures']}/{n_bootstrap} bootstrap fits failed (used fallback)")
+        # Plot comparison
+        comparison_path = Path(plots_dir) / f"asymptotic_gap_comparison_{cond_a.replace('+', '_').replace('(', '').replace(')', '')}_vs_{cond_b.replace('+', '_').replace('(', '').replace(')', '')}.png"
+        plot_exp_vs_power_analysis(steps, gaps, result, label, comparison_path)
 
-        # Plot
-        output_path = Path(plots_dir) / f"asymptotic_gap_{cond_a.replace('+', '_').replace('(', '').replace(')', '')}_vs_{cond_b.replace('+', '_').replace('(', '').replace(')', '')}.png"
-        plot_analysis(steps, gaps, result, label, output_path)
+        # Plot individual models
+        for model_name, model_data in result['per_model'].items():
+            model_slug = model_name.lower().replace(' ', '_')
+            individual_path = Path(plots_dir) / f"asymptotic_gap_{model_slug}_{cond_a.replace('+', '_').replace('(', '').replace(')', '')}_vs_{cond_b.replace('+', '_').replace('(', '').replace(')', '')}.png"
+
+            # Create a result dict compatible with plot_analysis
+            individual_result = {
+                'success': True,
+                'gap_inf': model_data['gap_inf'],
+                'ci_95': model_data['ci_95'],
+                'se': model_data['se'],
+                'bootstrap_samples': model_data['bootstrap_samples'],
+                'frac_positive': model_data['frac_positive'],
+                'n_fit_failures': model_data['n_failures'],
+                'point_fit': fit_single_exp(steps, np.mean(gaps, axis=0)) if 'exponential' in model_name.lower() else fit_power_law(steps, np.mean(gaps, axis=0))
+            }
+            plot_analysis(steps, gaps, individual_result, f"{label}\n({model_name})", individual_path)
+
+        # For summary table, use BIC-selected model
+        bic_model = result['per_model'][result['bic_selected']]
+        result['gap_inf'] = bic_model['gap_inf']
+        result['ci_95'] = bic_model['ci_95']
+        result['frac_positive'] = bic_model['frac_positive']
+
+    # Autocorrelation diagnostic
+    print("\n  === Autocorrelation Diagnostic ===")
+    autocorr_result = test_autocorrelation_structure(
+        steps, gaps, max_lag=5, n_permutations=1000, verbose=True
+    )
+
+    if autocorr_result['success']:
+        # Save diagnostic plot
+        safe_label = label.replace(' ', '_').replace('/', '_').replace('+', '_').replace('(', '').replace(')', '')
+        autocorr_plot_path = Path(plots_dir) / f"autocorr_diagnostic_{safe_label}.png"
+        plot_autocorrelation_diagnostic(autocorr_result, autocorr_plot_path)
+
+        # Store summary for reporting
+        result['autocorr_diagnostic'] = {
+            'threat_level': autocorr_result['threat_level'],
+            'vif': float(autocorr_result['vif']),
+            'within_acf_lag1': float(autocorr_result['within_seed_acf'][0]),
+            'between_ccf_lag1': float(autocorr_result['between_seed_ccf'][0]),
+            'threat_ratio_lag1': float(autocorr_result['threat_ratio'][0]),
+            'p_value_lag1': float(autocorr_result['p_values'][0]),
+            'recommendation': autocorr_result['recommendation']['message']
+        }
+
+    # Model cross-validation
+    print("\n  === Model Cross-Validation ===")
+    cv_result = cross_validate_models(steps, gaps, verbose=True)
+
+    # Save cross-validation plot
+    cv_plot_path = Path(plots_dir) / f"model_cv_{safe_label}.png"
+    plot_cross_validation(cv_result, cv_plot_path, title=f"Model Cross-Validation: {label}")
+
+    # Store best model info
+    result['cross_validation'] = {
+        'best_model': cv_result['best_model'],
+        'mean_test_rmse': {name: float(model_data['mean_test_rmse'])
+                          for name, model_data in cv_result['models'].items()
+                          if 'mean_test_rmse' in model_data}
+    }
 
     return result
 
@@ -1602,6 +2735,56 @@ def print_summary(results):
 
     print("="*80)
 
+    # Autocorrelation diagnostic summary
+    has_autocorr_data = any(result and 'autocorr_diagnostic' in result
+                            for result in results.values())
+
+    if has_autocorr_data:
+        print("\n" + "="*80)
+        print("  AUTOCORRELATION DIAGNOSTIC SUMMARY")
+        print("="*80)
+        print(f"\n{'Comparison':<30} {'ACF[1]':>8} {'CCF[1]':>8} {'TR[1]':>8} {'VIF':>8} {'n_eff':>8}")
+        print("-"*80)
+
+        for label, result in results.items():
+            if result and 'autocorr_diagnostic' in result:
+                diag = result['autocorr_diagnostic']
+                n_eff = result['n_steps'] / diag['vif'] if 'n_steps' in result else 61 / diag['vif']
+                print(f"{label:<30} {diag['within_acf_lag1']:>8.3f} {diag['between_ccf_lag1']:>8.3f} "
+                      f"{diag['threat_ratio_lag1']:>8.2f} {diag['vif']:>8.2f} {n_eff:>8.1f}")
+
+        print("="*80)
+        print("\nColumn definitions:")
+        print("  ACF[1]: Within-seed autocorrelation at lag 1")
+        print("  CCF[1]: Between-seed cross-correlation at lag 1")
+        print("  TR[1]: Threat ratio (ACF/CCF) at lag 1")
+        print("  VIF: Variance inflation factor (time points / effective sample size)")
+        print("  n_eff: Effective number of independent observations within each seed")
+
+    # Cross-validation summary
+    has_cv_data = any(result and 'cross_validation' in result
+                      for result in results.values())
+
+    if has_cv_data:
+        print("\n" + "="*80)
+        print("  MODEL CROSS-VALIDATION SUMMARY")
+        print("="*80)
+        print(f"\n{'Comparison':<30} {'Best Model':<20} {'RMSE':>12}")
+        print("-"*80)
+
+        for label, result in results.items():
+            if result and 'cross_validation' in result:
+                cv = result['cross_validation']
+                best = cv['best_model']
+                rmse = cv['mean_test_rmse'].get(best, float('nan'))
+                print(f"{label:<30} {best:<20} {rmse:>12.5f}")
+
+        print("="*80)
+        print("\nInterpretation:")
+        print("  Best Model: Model with lowest mean out-of-sample prediction error")
+        print("  RMSE: Root mean squared error on held-out test data")
+        print("  Lower RMSE indicates better extrapolation to unseen future training steps")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1609,43 +2792,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run asymptotic gap analysis (default)
-  python analyze_asymptotic_gap.py
+  # Run full analysis (default)
+  python analyze_experiment.py
 
-  # Run with all models bootstrapped
-  python analyze_asymptotic_gap.py --all-models
-
-  # Run alpha sweep analysis
-  python analyze_asymptotic_gap.py --alpha-sweep
-
-  # Run permutation test
-  python analyze_asymptotic_gap.py --permutation
-
-  # Run layer comparison analysis
-  python analyze_asymptotic_gap.py --layer-comparison
-
-  # Run everything
-  python analyze_asymptotic_gap.py --full
+  # Run only specific analyses
+  python analyze_experiment.py --asymptotic
+  python analyze_experiment.py --layer-comparison
+  python analyze_experiment.py --horizon
         """
     )
 
     # Analysis selection
     analysis = parser.add_argument_group('Analysis Selection')
-    analysis.add_argument('--full', action='store_true',
-                         help='Run all analyses')
     analysis.add_argument('--asymptotic', action='store_true',
-                         help='Run asymptotic gap analysis (default if nothing specified)')
+                         help='Run only asymptotic gap analysis')
     analysis.add_argument('--alpha-sweep', action='store_true',
-                         help='Run alpha sweep analysis on checkpoints')
+                         help='Run only alpha sweep analysis')
     analysis.add_argument('--permutation', action='store_true',
-                         help='Run permutation test for sector validity')
+                         help='Run only permutation test')
     analysis.add_argument('--layer-comparison', action='store_true',
-                         help='Run multi-layer comparison analysis')
+                         help='Run only layer comparison analysis')
+    analysis.add_argument('--horizon', action='store_true',
+                         help='Run only horizon stability analysis')
 
     # Asymptotic options
     asymp = parser.add_argument_group('Asymptotic Analysis Options')
     asymp.add_argument('--all-models', action='store_true',
-                      help='Bootstrap all 4 models, not just BIC-selected')
+                      help='Bootstrap all models instead of just BIC-selected')
     asymp.add_argument('--bootstrap', type=int, default=5000,
                       help='Number of bootstrap iterations (default: 5000)')
     asymp.add_argument('--layer', type=str, default='2',
@@ -1678,16 +2851,19 @@ Examples:
 
     args = parser.parse_args()
 
-    # Default to asymptotic analysis if nothing specified
-    if not any([args.full, args.asymptotic, args.alpha_sweep, args.permutation, args.layer_comparison]):
-        args.asymptotic = True
+    # Determine which analyses to run
+    specific_analysis = any([args.asymptotic, args.alpha_sweep, args.permutation,
+                             args.layer_comparison, args.horizon])
 
-    # If --full, enable all
-    if args.full:
+    if not specific_analysis:
+        # Default: run everything
         args.asymptotic = True
         args.alpha_sweep = True
         args.permutation = True
         args.layer_comparison = True
+        args.horizon = True
+
+    # all_models is already set by argparse (False by default)
 
     # Create output directories
     output_dir = Path(args.output_dir)
@@ -1711,10 +2887,11 @@ Examples:
             return
 
         print(f"Found {len(histories)} model runs")
+        print(f"Bootstrap iterations: {args.bootstrap}")
         if args.all_models:
-            print("Mode: Bootstrap ALL models and check agreement")
+            print("Mode: Bootstrap all 4 models and check agreement")
         else:
-            print("Mode: Bootstrap BIC-best model only")
+            print("Mode: Bootstrap exponential + power law models")
 
         asymp_dir = output_dir / 'asymptotic'
         asymp_dir.mkdir(parents=True, exist_ok=True)
@@ -1844,6 +3021,55 @@ Examples:
                 json.dump(results_json, f, indent=2)
 
             analyses_run.append('layer_comparison')
+
+    # =========================================================================
+    # Horizon Stability Analysis
+    # =========================================================================
+    if args.horizon:
+        print("\n" + "="*80)
+        print("  HORIZON STABILITY ANALYSIS")
+        print("="*80)
+
+        try:
+            histories = load_histories(args.histories)
+        except FileNotFoundError:
+            print(f"Error: {args.histories} not found. Run the experiment first.")
+            histories = None
+
+        if histories:
+            horizon_dir = output_dir / 'horizon'
+            horizon_dir.mkdir(parents=True, exist_ok=True)
+
+            # Analyze main comparison (embed+aux vs baseline)
+            print("\nEmbed+Aux vs Baseline:")
+            results = analyze_horizon_stability(
+                histories, 'Large+embed(aux)', 'Large-baseline',
+                'Embed+Aux vs Baseline', layer=args.layer
+            )
+            plot_horizon_stability(results, horizon_dir / 'horizon_embed_aux_vs_baseline.png',
+                                   title='Horizon Stability: Embed+Aux vs Baseline')
+
+            # Save results (convert numpy types to native Python for JSON)
+            results_json = {
+                'horizons': [int(h) for h in results['horizons']],
+                'models': {}
+            }
+            for name in ['Single exponential', 'Double exponential', 'Power law']:
+                if name in results:
+                    results_json['models'][name] = [
+                        {
+                            'horizon': int(r['horizon']),
+                            'gap_inf': float(r['gap_inf']) if not np.isnan(r['gap_inf']) else None,
+                            'ci_95': [float(r['ci_95'][0]), float(r['ci_95'][1])] if r['success'] else None,
+                            'se': float(r.get('se', 0)) if r['success'] else None,
+                            'success': r['success']
+                        }
+                        for r in results[name]
+                    ]
+            with open(horizon_dir / 'horizon_results.json', 'w') as f:
+                json.dump(results_json, f, indent=2)
+
+            analyses_run.append('horizon')
 
     # =========================================================================
     # Final Summary
