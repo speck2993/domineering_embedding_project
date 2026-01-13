@@ -10,6 +10,7 @@ checkpoints/
 # Experiment outputs
 plots/
 results/
+analysis_results/
 
 # Test and dry run outputs
 test_artifacts/
